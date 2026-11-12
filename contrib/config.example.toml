@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: LicenseRef-Reticulum
+# lxmf-bouncer configuration. Relative paths are relative to this file;
+# a leading ~/ is the home directory.
+
+# The identity whose messages the bouncer holds: a Reticulum identity file
+# (64 bytes). Copy the one your main client uses, e.g. NomadNet's
+# ~/.nomadnetwork/storage/identity. Keep it private (chmod 600).
+identity = "~/.local/share/lxmf-bouncer/identity"
+
+# Message store, ratchets, the node's identity, the generated Reticulum
+# config and status.json live here.
+state_dir = "~/.local/share/lxmf-bouncer"
+
+# The name announced with your LXMF address (what others see).
+display_name = "funkpower"
+
+# error, warn, info, debug, trace, or a tracing filter such as
+# "info,lxmf_bouncer=debug". RUST_LOG overrides it.
+log_level = "info"
+
+[reticulum]
+# Exactly one of these three.
+#
+# Attach to the Reticulum shared instance (rnsd) on this host. The bouncer
+# refuses to start if none is running, rather than becoming one.
+shared_instance = true
+# instance_name = "default"
+#
+# Or connect to an rnsd's TCPServerInterface:
+# tcp = "10.7.1.20:4242"
+#
+# Or use a complete Reticulum config directory of its own:
+# config_dir = "~/.local/share/lxmf-bouncer/reticulum-custom"
+
+[announce]
+# Minutes between announces of your LXMF address and of the node.
+interval_minutes = 30
+
+[store]
+max_size_mb = 500
+# Days each message is kept. Every client gets its own copy until then.
+expiry_days = 30
+
+[node]
+# The name the propagation node announces.
+name = "funkpower bouncer"
+# The node's own identity (created on first run). Default: state_dir/node_identity.
+# identity = "~/.local/share/lxmf-bouncer/node_identity"
+# Identities (hashes, not addresses) allowed to sync besides yours.
+allowed_identities = []
+
+[upstream]
+# A propagation node that may hold messages for you (people whose direct
+# delivery failed send there). Optional.
+# node = "a67a6768c612e972746eaaeb6ee242e1"
+interval_minutes = 15
+# Ratchet files of clients that announced your address before the bouncer
+# did. Senders may still encrypt to those ratchets for a while (they keep
+# the newest ratchet they heard); with these the bouncer can read such
+# messages from the upstream node.
+# extra_ratchets = ["~/.nomadnetwork/storage/lxmf/ratchets/<your LXMF address>.ratchets"]

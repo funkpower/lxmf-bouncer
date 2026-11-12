@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: LicenseRef-Reticulum
+# systemd user unit. Install:
+#   cp lxmf-bouncer.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lxmf-bouncer
+#   loginctl enable-linger "$USER"   # keep it running while logged out
+# Logs: journalctl --user -u lxmf-bouncer
+
+[Unit]
+Description=lxmf-bouncer: one LXMF identity for several LXMF apps
+# With shared_instance = true the bouncer needs rnsd running first; it
+# exits (and is restarted) while rnsd is down.
+After=rnsd.service network-online.target
+Wants=rnsd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lxmf-bouncer --config %h/.config/lxmf-bouncer/config.toml run
+Restart=always
+RestartSec=15
+# The store and identity are private.
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,40 @@
+[package]
+name = "lxmf-bouncer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Hold one LXMF identity for several LXMF apps: receive everything, serve it back to each app"
+license-file = "LICENSE"
+publish = false
+
+# rsReticulum and rsLXMF are git submodules under deps/, pinned to their
+# v1.4.0 release commits. rsLXMF finds rsReticulum as its sibling, which is
+# why they are submodules and not cargo git dependencies.
+[workspace]
+exclude = ["deps"]
+
+[dependencies]
+rns-runtime = { path = "deps/rsReticulum/crates/rns-runtime" }
+rns-identity = { path = "deps/rsReticulum/crates/rns-identity" }
+rns-crypto = { path = "deps/rsReticulum/crates/rns-crypto" }
+rns-transport = { path = "deps/rsReticulum/crates/rns-transport" }
+lxmf-core = { path = "deps/rsLXMF/crates/lxmf-core" }
+
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rmpv = "1"
+hex = "0.4"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
