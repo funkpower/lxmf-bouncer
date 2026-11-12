@@ -31,6 +31,23 @@ pub struct Config {
     pub node: NodeSection,
     #[serde(default)]
     pub upstream: UpstreamSection,
+    /// Identities the user had before, whose messages the bouncer also
+    /// takes and hands to the apps (`[[old_identity]]`).
+    #[serde(default)]
+    pub old_identity: Vec<OldIdentitySection>,
+}
+
+/// An identity the user had before (people may still write to its
+/// address).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OldIdentitySection {
+    /// Its private key file.
+    pub identity: PathBuf,
+    /// Ratchet files of apps that announced its address (see
+    /// `[upstream] extra_ratchets`).
+    #[serde(default)]
+    pub extra_ratchets: Vec<PathBuf>,
 }
 
 /// How to reach Reticulum. Exactly one of `shared_instance`, `tcp` or
@@ -173,6 +190,8 @@ pub struct Settings {
     pub upstream: Option<[u8; 16]>,
     pub upstream_interval: Duration,
     pub extra_ratchets: Vec<PathBuf>,
+    /// Old identities: key file and extra ratchet files.
+    pub old_identities: Vec<(PathBuf, Vec<PathBuf>)>,
 }
 
 /// Parse a 16-byte hash written as 32 hex characters (`<` `>` and `:`
@@ -291,6 +310,16 @@ impl Config {
             upstream,
             upstream_interval: Duration::from_secs(self.upstream.interval_minutes * 60),
             extra_ratchets: self.upstream.extra_ratchets.iter().map(|p| resolve(p)).collect(),
+            old_identities: self
+                .old_identity
+                .iter()
+                .map(|o| {
+                    (
+                        resolve(&o.identity),
+                        o.extra_ratchets.iter().map(|p| resolve(p)).collect(),
+                    )
+                })
+                .collect(),
         })
     }
 }

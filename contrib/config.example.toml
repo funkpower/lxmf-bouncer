@@ -60,3 +60,10 @@ interval_minutes = 15
 # the newest ratchet they heard); with these the bouncer can read such
 # messages from the upstream node.
 # extra_ratchets = ["~/.nomadnetwork/storage/lxmf/ratchets/<your LXMF address>.ratchets"]
+
+# An identity you used before, whose address people may still write to.
+# The bouncer announces its address too and hands its messages to your
+# apps, moved to your current address. Repeat the table for more.
+# [[old_identity]]
+# identity = "~/.local/share/lxmf-bouncer/old.identity"
+# extra_ratchets = ["~/.nomadnetwork/storage/lxmf/ratchets/<old LXMF address>.ratchets"]

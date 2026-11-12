@@ -8,6 +8,7 @@ any other network. Run through tests/e2e.sh, which builds the bouncer and
 picks the Python environment.
 
   U  the user's identity, held by the bouncer
+  O  an identity U had before, also held by the bouncer
   S  a sender (Python LXMF), online throughout
   C1, C2, C3  Python LXMF clients holding U, syncing from the bouncer
   X  an identity the bouncer does not allow
@@ -164,7 +165,8 @@ class Run:
                     f'[reticulum]\n{reticulum}\n\n'
                     f'[announce]\ninterval_minutes = 30\n\n'
                     f'[node]\nname = "e2e bouncer"\n\n'
-                    f'[upstream]\nnode = "{upstream}"\ninterval_minutes = 1\n')
+                    f'[upstream]\nnode = "{upstream}"\ninterval_minutes = 1\n\n'
+                    f'[[old_identity]]\nidentity = "{self.path("ids", "O")}"\n')
         return path
 
     def start_bouncer(self):
@@ -203,10 +205,10 @@ def main():
     print(f"work directory {args.work}, private network on 127.0.0.1:{run.port}", flush=True)
     try:
         ids = {}
-        for name in ["U", "S", "X", "P"]:
+        for name in ["U", "S", "X", "P", "O"]:
             make_identity(args.python, run.path("ids", name))
             ids[name] = hashes(args.python, run.path("ids", name))
-        U, S, P = ids["U"], ids["S"], ids["P"]
+        U, S, P, O = ids["U"], ids["S"], ids["P"], ids["O"]
 
         print("starting the network, the bouncer and the sender", flush=True)
         hub = rns_config(run.path("rns", "hub"), run.port, server=True)
@@ -218,13 +220,14 @@ def main():
         node = hashes_out.split("propagation node")[1].split()[0]
         check(U["delivery"] in hashes_out and len(node) == 32 and node != U["propagation"],
               "`hashes` prints the user's LXMF address and the node's (under its own identity)")
+        check(f"old address        {O['delivery']}" in hashes_out, "`hashes` prints the old address")
 
         argv, _ = run.peer("sender", "S", run.path("ids", "S"), "--events", run.path("S.events"))
         sender = run.start("S", argv, stdin=subprocess.PIPE)
         check(run.wait_event("S", lambda e: e["event"] == "ready", 30) is not None, "sender S is up")
 
-        def send(content, method, title="", pn=None, timeout=120):
-            command = {"to": U["delivery"], "content": content, "title": title, "method": method, "id": content}
+        def send(content, method, title="", pn=None, timeout=120, to=None):
+            command = {"to": to or U["delivery"], "content": content, "title": title, "method": method, "id": content}
             if pn:
                 command["pn"] = pn
             sender.stdin.write((json.dumps(command) + "\n").encode())
@@ -259,7 +262,7 @@ def main():
 
         print("C2 (another client holding U) syncs: gets its own copies", flush=True)
         c2 = run.client("C2", run.path("ids", "U"), node, know=[S["delivery"]])
-        check(set(by_hash(c2)) == {m1["hash"], m2["hash"]}, "C2 received both messages too")
+        check({m1["hash"], m2["hash"]} <= set(by_hash(c2)), "C2 received both messages too")
         check(all(m["signature_validated"] for m in c2["received"]), "signatures valid at C2")
 
         print("C1 replies to S", flush=True)
@@ -269,6 +272,16 @@ def main():
         reply = run.wait_event("S", lambda e: e["event"] == "received" and e["content"] == "reply from C1", 30)
         check(reply is not None, "S received the reply")
         check(reply["source"] == U["delivery"] and reply["signature_validated"], "the reply is from U, signature valid")
+
+        print("S writes to U's old address O", flush=True)
+        mo = send("to the old address", "direct", to=O["delivery"])
+        check(mo["ok"] and mo["state"] == 0x08, "direct message to O delivered (proved) by the bouncer")
+        check(run.wait_log("bouncer", "sent to old address " + O["delivery"], 30), "the bouncer stored it, moved to U")
+        c1o = run.client("C1", run.path("ids", "U"), node, know=[S["delivery"]])
+        moved = [m for m in c1o["received"] if m["content"] == "to the old address"]
+        check(len(moved) == 1 and moved[0]["source"] == S["delivery"] and moved[0]["destination"] == U["delivery"],
+              "C1 got it, from S, addressed to U")
+        check(not moved[0]["signature_validated"], "its signature no longer matches (it was sent to O)")
 
         print("X (not allowed) tries to sync from the bouncer", flush=True)
         x = run.client("X", run.path("ids", "X"), node)
@@ -281,6 +294,8 @@ def main():
         time.sleep(3)
         m3 = send("third message, via a propagation node", "propagated", pn=P["propagation"], timeout=180)
         check(m3["ok"], "S handed the message to P")
+        m3o = send("to the old address, via P", "propagated", pn=P["propagation"], to=O["delivery"], timeout=180)
+        check(m3o["ok"], "S handed a message for O to P")
 
         print("restarting the bouncer", flush=True)
         check(run.stop("bouncer") == 0, "the bouncer stopped cleanly on SIGTERM")
@@ -288,15 +303,19 @@ def main():
         run.start_bouncer()
         check(run.wait_log("bouncer", f"stored message {m3['hash']}", 150, after=offset),
               "the bouncer fetched U's message from P (decrypted with its ratchets)")
+        check(run.wait_log("bouncer", "from upstream, sent to old address " + O["delivery"], 60, after=offset),
+              "the bouncer fetched O's message from P too, moved to U")
 
         print("C3 (a fresh client holding U) syncs after the restart", flush=True)
         c3 = run.client("C3", run.path("ids", "U"), node, know=[S["delivery"]])
-        check(set(by_hash(c3)) == {m1["hash"], m2["hash"], m3["hash"]},
-              "C3 received the two messages stored before the restart and the one from P")
+        check({m1["hash"], m2["hash"], m3["hash"]} <= set(by_hash(c3)) and len(c3["received"]) == 5,
+              "C3 received the three messages stored before the restart and the two from P")
+        check(any(m["content"] == "to the old address, via P" and m["source"] == S["delivery"] for m in c3["received"]),
+              "including O's, from S")
         check(by_hash(c3)[m3["hash"]]["source"] == S["delivery"], "the message from P is from S")
 
         c1c = run.client("C1", run.path("ids", "U"), node)
-        check([m["hash"] for m in c1c["received"]] == [m3["hash"]], "C1 gets just the new message from P")
+        check(len(c1c["received"]) == 2 and m3["hash"] in by_hash(c1c), "C1 gets just the two new messages from P")
 
         offset = run.log_size("bouncer")
         check(run.wait_log("bouncer", "upstream fetch", 90, after=offset), "the bouncer fetched from P again")
@@ -324,8 +343,8 @@ def main():
         run.stop("bouncer")
         status = subprocess.run([args.bouncer, "--config", run.config, "status", "--json"], capture_output=True, text=True, check=True).stdout
         status = json.loads(status)
-        check(status["store"]["messages"] == 3 and status["store"]["by_sender"] == {S["delivery"]: 3},
-              "`status` shows 3 messages from S")
+        check(status["store"]["messages"] == 5 and status["store"]["by_sender"] == {S["delivery"]: 5},
+              "`status` shows 5 messages from S")
         check(status["outbox"] == 0 and status["sent_upstream"] == 1, "`status` shows the send passed upstream, none waiting")
 
         print("the bouncer as a client of a local shared instance (a Python rnsd)", flush=True)

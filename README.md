@@ -54,6 +54,14 @@ What it does:
   takes it (or `expiry_days` pass). The recipient collects it there when
   they come online. The message is encrypted for the recipient; the bouncer
   can't read it. Without an upstream node the bouncer takes nothing in.
+- **Keeps your old addresses working (optional).** If you used another
+  identity before, people may still write to its address. List it as an
+  `[[old_identity]]` and the bouncer announces that address too, takes its
+  messages (directly and from the upstream node), checks their signatures,
+  and moves them to your address so your apps can open them. They show in
+  the sender's conversation, and your reply goes to the sender from your
+  current address. Because the sender signed the old address, apps mark
+  these messages' signatures as invalid (NomadNet: "Invalid Signature").
 - **Doesn't peer.** The node announces itself as inactive, so other
   propagation nodes don't peer with it, and it never peers with them.
 - **Survives restarts.** The store is rsLXMF's on-disk propagation store
@@ -132,6 +140,8 @@ directory.
 | `[upstream] node` | none | A propagation node (`lxmf.propagation` hash) to fetch your messages from, and to pass on what your apps send through the bouncer. |
 | `[upstream] interval_minutes` | `15` | Time between fetches. |
 | `[upstream] extra_ratchets` | `[]` | Ratchet files of apps that announced your address before the bouncer (see [Limits](#limits)). |
+| `[[old_identity]] identity` | none | An identity you used before; repeat the table for more. |
+| `[[old_identity]] extra_ratchets` | `[]` | Ratchet files of apps that announced that old address. |
 
 Set exactly one of `shared_instance`, `tcp` or `config_dir`. With
 `shared_instance` or `tcp` the bouncer writes its own Reticulum config to

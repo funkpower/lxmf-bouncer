@@ -134,6 +134,16 @@ pub struct Counters {
     pub sent_upstream: AtomicU64,
 }
 
+/// An identity the user had before: messages to its address are taken in,
+/// moved to the user's address and kept for the apps.
+#[derive(Clone)]
+pub struct OldIdentity {
+    pub identity: Identity,
+    pub address: [u8; 16],
+    /// Ratchet rings to decrypt its propagated messages with.
+    pub rings: Vec<std::path::PathBuf>,
+}
+
 /// What the tasks share.
 pub struct Shared {
     pub runtime: ReticulumHandle,
@@ -149,11 +159,21 @@ pub struct Shared {
     /// Ratchet rings to decrypt propagated messages with: the bouncer's own,
     /// then any configured extra ones.
     pub rings: Vec<std::path::PathBuf>,
+    pub old: Vec<OldIdentity>,
 }
 
 /// Check, verify and store one complete LXMF message for the user. Returns
 /// whether it is now held (stored, or held already).
 pub async fn take_in(shared: &Arc<Shared>, packed: Vec<u8>, via: Via) -> bool {
+    take_in_for(shared, packed, via, None).await
+}
+
+/// As [`take_in`], for a message to the user's address or, with `old`, to
+/// that old address. A message to an old address is verified as sent, then
+/// moved to the user's address, so the apps (which hold only the user's
+/// identity) can open it. Its signature covers the address it was sent to,
+/// so the apps show it as not matching; replies go to its sender as usual.
+pub async fn take_in_for(shared: &Arc<Shared>, packed: Vec<u8>, via: Via, old: Option<[u8; 16]>) -> bool {
     let message = match LxMessage::unpack(&packed) {
         Ok(message) => message,
         Err(e) => {
@@ -177,6 +197,19 @@ pub async fn take_in(shared: &Arc<Shared>, packed: Vec<u8>, via: Via) -> bool {
         },
         _ => "sender unknown, signature not checked",
     };
+    let (packed, moved) = match old {
+        None => (packed, String::new()),
+        Some(old) => {
+            if packed.len() < 16 || packed[..16] != old {
+                shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!("dropped a message not addressed to old address {}", hex::encode(old));
+                return false;
+            }
+            let mut moved = shared.store.user_address().to_vec();
+            moved.extend_from_slice(&packed[16..]);
+            (moved, format!(", sent to old address {}", hex::encode(old)))
+        }
+    };
     let store = shared.store.clone();
     let result = tokio::task::spawn_blocking(move || store.ingest(&packed, via)).await;
     match result {
@@ -190,7 +223,7 @@ pub async fn take_in(shared: &Arc<Shared>, packed: Vec<u8>, via: Via) -> bool {
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::info!(
-                "stored message {} from {} ({}, {verified}; transient id {})",
+                "stored message {} from {} ({}{moved}, {verified}; transient id {})",
                 hex::encode(message_id),
                 hex::encode(source),
                 via_label(via),
@@ -344,6 +377,22 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     let ring = ratchets::ring_path(&settings.ratchet_dir(), &address);
     let mut rings = vec![ring.clone()];
     rings.extend(settings.extra_ratchets.iter().cloned());
+    let shared_user_hash = identity.hash;
+    let mut old = Vec::new();
+    for (path, extra) in &settings.old_identities {
+        let identity = load_identity(path)?;
+        if identity.hash == shared_user_hash {
+            return Err(format!("old identity {} is the current identity", path.display()));
+        }
+        let old_address = delivery_address(&identity.hash);
+        let mut rings = vec![ratchets::ring_path(&settings.ratchet_dir(), &old_address)];
+        rings.extend(extra.iter().cloned());
+        old.push(OldIdentity {
+            identity,
+            address: old_address,
+            rings,
+        });
+    }
     let shared = Arc::new(Shared {
         runtime: runtime.clone(),
         identity: identity.clone(),
@@ -355,6 +404,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         last_announce: Mutex::new(None),
         last_upstream: Mutex::new(None),
         rings,
+        old: old.clone(),
     });
 
     // The user's LXMF address, with ratchets as Python LXMF gives every
@@ -374,6 +424,27 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         )
         .await
         .map_err(|e| format!("could not register the LXMF address: {e}"))?;
+
+    // Old addresses: announced and taken in like the user's.
+    let mut old_deliveries = Vec::new();
+    for o in &old {
+        let registered = runtime
+            .register_ratcheted_destination(
+                o.identity.clone(),
+                DELIVERY_ASPECT,
+                DestinationRuntimeOptions {
+                    proof_strategy: ProofStrategy::ProveAll,
+                    resource_strategy: ResourceStrategy::AcceptAll,
+                    default_app_data: Some(get_announce_app_data(display_name.as_deref(), None)),
+                    ..DestinationRuntimeOptions::default()
+                },
+                DestinationRatchetOptions::new(&o.rings[0]),
+            )
+            .await
+            .map_err(|e| format!("could not register old address {}: {e}", hex::encode(o.address)))?;
+        tracing::info!("also taking messages to old address {}", hex::encode(o.address));
+        old_deliveries.push((registered, o.address));
+    }
 
     // The propagation node: `/get` for allowed identities, and, when there
     // is an upstream node to pass them to, the messages apps send through
@@ -456,15 +527,24 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         tokio::spawn(announcer(
             shared.clone(),
             delivery.handle.clone(),
+            old_deliveries.iter().map(|(r, _)| r.handle.clone()).collect(),
             node.handle.clone(),
             settings.announce_interval,
             display_name,
             settings.node_name.clone(),
         )),
-        tokio::spawn(delivery_events(shared.clone(), delivery, address)),
+        tokio::spawn(delivery_events(shared.clone(), delivery, address, None)),
         tokio::spawn(node_events(shared.clone(), node, takes_sends)),
         tokio::spawn(housekeeping(shared.clone(), settings.clone())),
     ];
+    for (registered, old_address) in old_deliveries {
+        tasks.push(tokio::spawn(delivery_events(
+            shared.clone(),
+            registered,
+            old_address,
+            Some(old_address),
+        )));
+    }
     if let Some(upstream) = settings.upstream {
         tracing::info!(
             "fetching from upstream propagation node {} every {} min",
@@ -492,6 +572,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
 async fn announcer(
     shared: Arc<Shared>,
     delivery: DestinationHandle,
+    old: Vec<DestinationHandle>,
     node: DestinationHandle,
     every: Duration,
     display_name: Option<String>,
@@ -511,6 +592,17 @@ async fn announcer(
                 ..DestinationAnnounceOptions::default()
             })
             .await;
+        for handle in &old {
+            if let Err(e) = handle
+                .announce(DestinationAnnounceOptions {
+                    app_data: Some(get_announce_app_data(display_name.as_deref(), None)),
+                    ..DestinationAnnounceOptions::default()
+                })
+                .await
+            {
+                tracing::warn!("announcing an old address failed: {e}");
+            }
+        }
         match (delivered, noded) {
             (Ok(()), Ok(())) => {
                 *shared.last_announce.lock().unwrap_or_else(|e| e.into_inner()) = Some(now());
@@ -524,7 +616,12 @@ async fn announcer(
 
 /// Messages to the user: one packet (opportunistic), or over a Link as a
 /// packet or a Resource (direct).
-async fn delivery_events(shared: Arc<Shared>, mut delivery: RegisteredDestination, address: [u8; 16]) {
+async fn delivery_events(
+    shared: Arc<Shared>,
+    mut delivery: RegisteredDestination,
+    address: [u8; 16],
+    old: Option<[u8; 16]>,
+) {
     let events = &mut delivery.events;
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let taker = {
@@ -532,7 +629,7 @@ async fn delivery_events(shared: Arc<Shared>, mut delivery: RegisteredDestinatio
         tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
                 let shared = shared.clone();
-                tokio::spawn(async move { take_in(&shared, data, Via::Direct).await });
+                tokio::spawn(async move { take_in_for(&shared, data, Via::Direct, old).await });
             }
         })
     };

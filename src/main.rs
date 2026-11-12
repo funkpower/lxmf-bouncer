@@ -156,6 +156,13 @@ fn main() -> ExitCode {
                 hex::encode(bouncer::delivery_address(&identity.hash))
             );
             println!("propagation node   {}", hex::encode(bouncer::node_address(&node.hash)));
+            for (path, _) in &settings.old_identities {
+                let old = bouncer::load_identity(path)?;
+                println!(
+                    "old address        {}",
+                    hex::encode(bouncer::delivery_address(&old.hash))
+                );
+            }
             Ok(())
         }),
         Command::Run => {

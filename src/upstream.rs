@@ -21,7 +21,7 @@ use lxmf_core::constants::MESSAGE_GET_PATH;
 use rmpv::Value;
 use rns_runtime::prelude::*;
 
-use crate::bouncer::{Shared, UpstreamResult, now, take_in};
+use crate::bouncer::{Shared, UpstreamResult, now, take_in_for};
 use crate::store::Via;
 
 /// How often to retry sending queued messages upstream.
@@ -75,8 +75,39 @@ pub async fn run(shared: Arc<Shared>, node: [u8; 16], interval: Duration) {
     // Messages that could not be opened stay on the node; don't fetch them
     // again each time.
     let mut skip: HashSet<Vec<u8>> = HashSet::new();
+    let user = Holder {
+        identity: shared.identity.clone(),
+        address: shared.store.user_address(),
+        rings: shared.rings.clone(),
+        old: false,
+    };
+    let holders: Vec<Holder> = std::iter::once(user)
+        .chain(shared.old.iter().map(|o| Holder {
+            identity: o.identity.clone(),
+            address: o.address,
+            rings: o.rings.clone(),
+            old: true,
+        }))
+        .collect();
     loop {
-        let result = fetch(&shared, node, &mut skip).await;
+        let mut result = UpstreamResult::default();
+        for holder in &holders {
+            let one = fetch(&shared, node, holder, &mut skip).await;
+            result.at = one.at;
+            result.stored += one.stored;
+            result.duplicates += one.duplicates;
+            result.failed += one.failed;
+            if result.error.is_none() {
+                result.error = one.error.map(|e| {
+                    if holder.old {
+                        format!("for old address {}: {e}", hex::encode(holder.address))
+                    } else {
+                        e
+                    }
+                });
+            }
+        }
+        result.ok = result.error.is_none();
         match &result.error {
             None if result.stored + result.failed > 0 => tracing::info!(
                 "upstream fetch: {} new, {} held already, {} not stored",
@@ -92,7 +123,15 @@ pub async fn run(shared: Arc<Shared>, node: [u8; 16], interval: Duration) {
     }
 }
 
-async fn fetch(shared: &Arc<Shared>, node: [u8; 16], skip: &mut HashSet<Vec<u8>>) -> UpstreamResult {
+/// An identity to fetch messages for: the user's, or an old one.
+struct Holder {
+    identity: Identity,
+    address: [u8; 16],
+    rings: Vec<std::path::PathBuf>,
+    old: bool,
+}
+
+async fn fetch(shared: &Arc<Shared>, node: [u8; 16], holder: &Holder, skip: &mut HashSet<Vec<u8>>) -> UpstreamResult {
     let mut result = UpstreamResult {
         at: now(),
         ..UpstreamResult::default()
@@ -113,7 +152,7 @@ async fn fetch(shared: &Arc<Shared>, node: [u8; 16], skip: &mut HashSet<Vec<u8>>
     };
     let session = match shared
         .runtime
-        .connect_link(node, shared.identity.clone(), options)
+        .connect_link(node, holder.identity.clone(), options)
         .await
     {
         Ok(session) => session,
@@ -123,7 +162,7 @@ async fn fetch(shared: &Arc<Shared>, node: [u8; 16], skip: &mut HashSet<Vec<u8>>
         }
     };
     let LinkSession { handle, .. } = session;
-    if let Err(e) = fetch_on(shared, &handle, skip, &mut result).await {
+    if let Err(e) = fetch_on(shared, &handle, holder, skip, &mut result).await {
         result.error = Some(e);
     }
     handle.close().await;
@@ -134,6 +173,7 @@ async fn fetch(shared: &Arc<Shared>, node: [u8; 16], skip: &mut HashSet<Vec<u8>>
 async fn fetch_on(
     shared: &Arc<Shared>,
     handle: &LinkSessionHandle,
+    holder: &Holder,
     skip: &mut HashSet<Vec<u8>>,
     result: &mut UpstreamResult,
 ) -> Result<(), String> {
@@ -144,7 +184,7 @@ async fn fetch_on(
         .into_iter()
         .filter(|id| id.as_slice().is_some_and(|id| !skip.contains(id)))
         .collect();
-    let address = shared.store.user_address();
+    let address = holder.address;
     for _ in 0..MAX_ROUNDS {
         if waiting.is_empty() {
             break;
@@ -171,7 +211,7 @@ async fn fetch_on(
                 result.failed += 1;
                 continue;
             }
-            let (identity, rings, ciphertext) = (shared.identity.clone(), shared.rings.clone(), blob[16..].to_vec());
+            let (identity, rings, ciphertext) = (holder.identity.clone(), holder.rings.clone(), blob[16..].to_vec());
             let opened = tokio::task::spawn_blocking(move || crate::ratchets::decrypt(&identity, &rings, &ciphertext))
                 .await
                 .map_err(|e| e.to_string())?;
@@ -189,11 +229,14 @@ async fn fetch_on(
             };
             let mut full = address.to_vec();
             full.extend_from_slice(&plaintext);
-            let message_id = lxmf_core::message_api::LxMessage::unpack(&full)
+            // As stored: moved to the user's address when it came to an old one.
+            let mut as_stored = shared.store.user_address().to_vec();
+            as_stored.extend_from_slice(&full[16..]);
+            let message_id = lxmf_core::message_api::LxMessage::unpack(&as_stored)
                 .ok()
                 .map(|m| m.message_id());
             let known = message_id.is_some_and(|id| shared.store.knows(&id));
-            if take_in(shared, full, Via::Upstream).await {
+            if take_in_for(shared, full, Via::Upstream, holder.old.then_some(address)).await {
                 if known {
                     result.duplicates += 1;
                 } else {
