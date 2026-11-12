@@ -8,6 +8,7 @@
 
 mod bouncer;
 mod config;
+mod outbox;
 mod ratchets;
 mod store;
 mod upstream;
@@ -119,6 +120,10 @@ fn status(settings: &config::Settings, json: bool) -> Result<(), String> {
     println!(
         "  clients            {} message(s) served in {} sync(s), {} refused",
         s.messages_served, s.syncs_served, s.syncs_refused
+    );
+    println!(
+        "  outgoing           {} waiting; since start {} queued, {} passed upstream, {} refused",
+        s.outbox, s.outgoing_queued, s.sent_upstream, s.outgoing_refused
     );
     match (&s.upstream, &s.last_upstream) {
         (None, _) => println!("  upstream           none"),

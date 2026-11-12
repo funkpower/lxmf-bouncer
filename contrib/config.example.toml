@@ -51,7 +51,8 @@ allowed_identities = []
 
 [upstream]
 # A propagation node that may hold messages for you (people whose direct
-# delivery failed send there). Optional.
+# delivery failed send there). Optional. The bouncer also passes it what
+# your apps send through the bouncer's node, for people who are offline.
 # node = "a67a6768c612e972746eaaeb6ee242e1"
 interval_minutes = 15
 # Ratchet files of clients that announced your address before the bouncer

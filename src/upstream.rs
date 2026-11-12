@@ -7,6 +7,11 @@
 //! a Link identified as the user, `/get [nil, nil]` for the list, `/get
 //! [wants, haves, limit]` for the messages, then `/get [nil, received]` so
 //! the node drops what the bouncer now holds.
+//!
+//! It also passes on what the user's apps send through the bouncer's node:
+//! each queued message goes to the upstream node as a Python LXMF client
+//! sends a propagated message (`[timestamp, [message + stamp]]` in a
+//! Resource over a Link), with a stamp meeting the upstream node's cost.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,6 +23,11 @@ use rns_runtime::prelude::*;
 
 use crate::bouncer::{Shared, UpstreamResult, now, take_in};
 use crate::store::Via;
+
+/// How often to retry sending queued messages upstream.
+const FORWARD_RETRY: Duration = Duration::from_secs(5 * 60);
+/// How long one message's transfer may take.
+const RESOURCE_TIMEOUT: Duration = Duration::from_secs(180);
 
 const FIRST_FETCH_DELAY: Duration = Duration::from_secs(20);
 const PATH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -203,4 +213,122 @@ async fn fetch_on(
         }
     }
     Ok(())
+}
+
+/// Pass queued outgoing messages to the upstream node: when one is queued,
+/// and every few minutes while any wait.
+pub async fn forward_loop(shared: Arc<Shared>, node: [u8; 16]) {
+    tokio::time::sleep(FIRST_FETCH_DELAY).await;
+    loop {
+        let outbox = shared.outbox.clone();
+        let pending = tokio::task::spawn_blocking(move || outbox.pending())
+            .await
+            .unwrap_or_default();
+        if !pending.is_empty() {
+            let waiting = pending.len();
+            match forward(&shared, node, pending).await {
+                Ok(sent) if sent == waiting => {}
+                Ok(sent) => {
+                    tracing::warn!("passed {sent} of {waiting} outgoing message(s) upstream; retrying the rest later")
+                }
+                Err(e) => tracing::warn!(
+                    "could not pass {waiting} outgoing message(s) to {}: {e}; retrying in {} min",
+                    hex::encode(node),
+                    FORWARD_RETRY.as_secs() / 60
+                ),
+            }
+        }
+        tokio::select! {
+            _ = shared.outbox_ready.notified() => {}
+            _ = tokio::time::sleep(FORWARD_RETRY) => {}
+        }
+    }
+}
+
+async fn forward(shared: &Arc<Shared>, node: [u8; 16], pending: Vec<crate::outbox::Queued>) -> Result<usize, String> {
+    shared
+        .runtime
+        .await_path(node, PATH_TIMEOUT)
+        .await
+        .map_err(|e| format!("no path to the node: {e}"))?;
+    // The stamp cost the node announced; a node that hasn't been heard
+    // gets the default cost.
+    let cost = match shared.runtime.recall(node).await {
+        Ok(Some(known)) => known
+            .app_data
+            .as_deref()
+            .and_then(lxmf_core::handlers::pn_stamp_cost_from_app_data)
+            .unwrap_or(lxmf_core::constants::PROPAGATION_COST),
+        _ => lxmf_core::constants::PROPAGATION_COST,
+    };
+    let options = LinkConnectOptions {
+        path_timeout: PATH_TIMEOUT,
+        client_label: "lxmf-bouncer.forward".into(),
+        // Python LXMF clients don't identify to send either.
+        identify: false,
+        establishment_timeout: Some(LINK_TIMEOUT),
+        ..LinkConnectOptions::default()
+    };
+    let LinkSession { handle, .. } = shared
+        .runtime
+        .connect_link(node, shared.identity.clone(), options)
+        .await
+        .map_err(|e| format!("no Link to the node: {e}"))?;
+    let mut sent = 0;
+    let mut failure = None;
+    for queued in pending {
+        let id = queued.transient_id;
+        let stamp = tokio::task::spawn_blocking(move || {
+            lxmf_core::stamper::generate_stamp(&id, cost, lxmf_core::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN)
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some((stamp, _)) = stamp else {
+            failure = Some(format!("could not make a stamp of cost {cost}"));
+            break;
+        };
+        let mut blob = queued.data;
+        blob.extend_from_slice(&stamp);
+        let wrapper = encode(&Value::Array(vec![
+            Value::F64(now()),
+            Value::Array(vec![Value::Binary(blob)]),
+        ]));
+        let transfer = match handle.send_resource_bytes(wrapper, ResourceOptions::default()).await {
+            Ok(transfer) => transfer,
+            Err(e) => {
+                failure = Some(format!("could not start the transfer: {e}"));
+                break;
+            }
+        };
+        match tokio::time::timeout(RESOURCE_TIMEOUT, transfer.concluded()).await {
+            Ok(Ok(_)) => {
+                let outbox = shared.outbox.clone();
+                let _ = tokio::task::spawn_blocking(move || outbox.remove(&id)).await;
+                shared
+                    .counters
+                    .sent_upstream
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!("passed outgoing message {} to {}", hex::encode(id), hex::encode(node));
+                sent += 1;
+            }
+            Ok(Err(e)) => {
+                failure = Some(format!("the node did not take message {}: {e}", hex::encode(id)));
+                break;
+            }
+            Err(_) => {
+                failure = Some(format!("sending message {} timed out", hex::encode(id)));
+                break;
+            }
+        }
+    }
+    handle.close().await;
+    match failure {
+        Some(e) if sent == 0 => Err(e),
+        Some(e) => {
+            tracing::warn!("{e}");
+            Ok(sent)
+        }
+        None => Ok(sent),
+    }
 }

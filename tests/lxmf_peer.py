@@ -3,11 +3,12 @@
 
 Roles:
   sender   long-running: announces itself, sends what it is told on stdin
-           (one JSON object per line), records sends and receipts as JSON
+           (one JSON object per line; {"sync": node} syncs from a
+           propagation node instead), records sends and receipts as JSON
            lines in --events.
   client   one-shot: syncs from a propagation node holding an identity
            (without announcing it), writes what arrived to --out, and can
-           then send a reply directly.
+           then send a reply directly, or a message through that node.
   pnode    long-running: an ordinary Python propagation node.
 
 Each process runs its own Reticulum instance from --rnsconfig.
@@ -130,6 +131,20 @@ def run_sender(args):
         if not line:
             continue
         command = json.loads(line)
+        if "sync" in command:
+            node = bytes.fromhex(command["sync"])
+            ensure_identity_known(node)
+            router.set_outbound_propagation_node(node)
+            router.request_messages_from_propagation_node(identity)
+            final = {LXMF.LXMRouter.PR_COMPLETE, LXMF.LXMRouter.PR_NO_PATH, LXMF.LXMRouter.PR_LINK_FAILED,
+                     LXMF.LXMRouter.PR_TRANSFER_FAILED, LXMF.LXMRouter.PR_NO_IDENTITY_RCVD,
+                     LXMF.LXMRouter.PR_NO_ACCESS, LXMF.LXMRouter.PR_FAILED}
+            wait_for(lambda: router.propagation_transfer_state in final, 60)
+            time.sleep(2)
+            emit(args.events, {"event": "synced", "id": command.get("id"),
+                               "state": router.propagation_transfer_state})
+            router.acknowledge_sync_completion(reset_state=True)
+            continue
         result = send_message(router, source, command["to"], command.get("title", ""), command["content"],
                               command.get("method", "direct"), command.get("pn"))
         emit(args.events, {"event": "sent", "id": command.get("id"), **result})
@@ -171,6 +186,10 @@ def run_client(args):
     if args.reply_to:
         source = router.delivery_destinations[RNS.Destination.hash(identity, "lxmf", "delivery")]
         result["reply"] = send_message(router, source, args.reply_to, "re", args.reply, "direct")
+    if args.send_to:
+        source = router.delivery_destinations[RNS.Destination.hash(identity, "lxmf", "delivery")]
+        result["sent"] = send_message(router, source, args.send_to, "", args.send, "propagated", pn_hex=args.pn,
+                                      timeout=120)
     with open(args.out, "w") as f:
         json.dump(result, f)
     # Let the purge request (and the reply's proof) go out before exiting.
@@ -204,6 +223,8 @@ def main():
     parser.add_argument("--know", action="append", default=[])
     parser.add_argument("--reply-to")
     parser.add_argument("--reply")
+    parser.add_argument("--send-to")
+    parser.add_argument("--send")
     args = parser.parse_args()
     {"sender": run_sender, "client": run_client, "pnode": run_pnode}[args.role](args)
 

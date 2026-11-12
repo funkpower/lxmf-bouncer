@@ -310,6 +310,9 @@ impl Settings {
     pub fn store_dir(&self) -> PathBuf {
         self.state_dir.join("messagestore")
     }
+    pub fn outbox_dir(&self) -> PathBuf {
+        self.state_dir.join("outbox")
+    }
     pub fn ratchet_dir(&self) -> PathBuf {
         self.state_dir.join("ratchets")
     }

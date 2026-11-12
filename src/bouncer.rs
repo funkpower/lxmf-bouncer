@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::{RnsAccess, Settings};
+use crate::outbox::{Added, Outbox};
 use crate::store::{ERROR_NO_ACCESS, ERROR_NO_IDENTITY, Ingested, Store, Summary, Via, error_reply, write_atomic};
 use crate::{ratchets, upstream};
 
@@ -29,6 +30,11 @@ const FIRST_ANNOUNCE_DELAY: Duration = Duration::from_secs(5);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const STATUS_INTERVAL: Duration = Duration::from_secs(60);
 const SUMMARY_LOG_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Most bytes of outgoing messages waiting for the upstream node.
+const OUTBOX_MAX_BYTES: u64 = 50_000_000;
+/// Largest send an app may hand the node, as Python LXMF's per-transfer
+/// limit for clients.
+const SUBMISSION_LIMIT_BYTES: usize = lxmf_core::constants::PROPAGATION_LIMIT * 1000;
 
 pub fn now() -> f64 {
     std::time::SystemTime::now()
@@ -101,6 +107,14 @@ pub struct Status {
     pub syncs_served: u64,
     pub syncs_refused: u64,
     pub messages_served: u64,
+    #[serde(default)]
+    pub outgoing_queued: u64,
+    #[serde(default)]
+    pub outgoing_refused: u64,
+    #[serde(default)]
+    pub sent_upstream: u64,
+    #[serde(default)]
+    pub outbox: usize,
     pub upstream: Option<String>,
     pub last_upstream: Option<UpstreamResult>,
     pub store: Summary,
@@ -115,6 +129,9 @@ pub struct Counters {
     pub syncs_served: AtomicU64,
     pub syncs_refused: AtomicU64,
     pub messages_served: AtomicU64,
+    pub outgoing_queued: AtomicU64,
+    pub outgoing_refused: AtomicU64,
+    pub sent_upstream: AtomicU64,
 }
 
 /// What the tasks share.
@@ -123,6 +140,9 @@ pub struct Shared {
     pub identity: Identity,
     pub node_identity: Identity,
     pub store: Arc<Store>,
+    pub outbox: Arc<Outbox>,
+    /// Woken when a message is queued for the upstream node.
+    pub outbox_ready: tokio::sync::Notify,
     pub counters: Counters,
     pub last_announce: Mutex<Option<f64>>,
     pub last_upstream: Mutex<Option<UpstreamResult>>,
@@ -315,6 +335,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             .map_err(|e| e.to_string())??
     };
     let store = Arc::new(store);
+    let outbox = Arc::new(Outbox::open(&settings.outbox_dir(), OUTBOX_MAX_BYTES, settings.expiry)?);
 
     let shutdown = ShutdownSignal::new();
     let mut signals = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
@@ -328,6 +349,8 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         identity: identity.clone(),
         node_identity: node_identity.clone(),
         store: store.clone(),
+        outbox,
+        outbox_ready: tokio::sync::Notify::new(),
         counters: Counters::default(),
         last_announce: Mutex::new(None),
         last_upstream: Mutex::new(None),
@@ -352,17 +375,30 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         .await
         .map_err(|e| format!("could not register the LXMF address: {e}"))?;
 
-    // The propagation node: only `/get`, only for allowed identities. It
-    // takes no messages in (no Resources, no proofs for packets), so a
-    // client's propagated send through it fails visibly instead of being
-    // kept where its recipient never looks.
+    // The propagation node: `/get` for allowed identities, and, when there
+    // is an upstream node to pass them to, the messages apps send through
+    // it. With no upstream it takes nothing in (no Resources, no proofs for
+    // packets), so a propagated send through it fails visibly instead of
+    // being kept where its recipient never looks.
+    let takes_sends = settings.upstream.is_some();
     let node = runtime
         .register_destination(
             node_identity.clone(),
             PROPAGATION_ASPECT,
             DestinationRuntimeOptions {
-                proof_strategy: ProofStrategy::ProveNone,
-                resource_strategy: ResourceStrategy::AcceptNone,
+                proof_strategy: if takes_sends {
+                    ProofStrategy::ProveAll
+                } else {
+                    ProofStrategy::ProveNone
+                },
+                resource_strategy: if takes_sends {
+                    ResourceStrategy::AcceptApp
+                } else {
+                    ResourceStrategy::AcceptNone
+                },
+                resource_accept: Some(ResourceAcceptPolicy::new(|_link, advert| {
+                    advert.data_size <= SUBMISSION_LIMIT_BYTES
+                })),
                 default_app_data: Some(node_app_data(settings.node_name.as_deref())),
                 ..DestinationRuntimeOptions::default()
             },
@@ -426,7 +462,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             settings.node_name.clone(),
         )),
         tokio::spawn(delivery_events(shared.clone(), delivery, address)),
-        tokio::spawn(node_events(node)),
+        tokio::spawn(node_events(shared.clone(), node, takes_sends)),
         tokio::spawn(housekeeping(shared.clone(), settings.clone())),
     ];
     if let Some(upstream) = settings.upstream {
@@ -440,6 +476,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             upstream,
             settings.upstream_interval,
         )));
+        tasks.push(tokio::spawn(upstream::forward_loop(shared.clone(), upstream)));
     }
 
     signals.recv().await;
@@ -518,15 +555,25 @@ async fn delivery_events(shared: Arc<Shared>, mut delivery: RegisteredDestinatio
     taker.abort();
 }
 
-/// The node's events: nothing comes in that it uses (requests are answered
-/// by the handler), but the queues are drained.
-async fn node_events(mut node: RegisteredDestination) {
+/// The node's events: messages the apps send through it (one Link packet,
+/// or a Resource) when it takes them; requests are answered by the handler.
+async fn node_events(shared: Arc<Shared>, mut node: RegisteredDestination, takes_sends: bool) {
     let events = &mut node.events;
     loop {
         tokio::select! {
             Some(_) = events.packets.recv() => {}
-            Some(_) = events.link_packets.recv() => tracing::debug!("ignored a packet sent to the propagation node"),
-            Some(_) = events.resource_completions.recv() => {}
+            Some((data, _link)) = events.link_packets.recv() => {
+                if takes_sends {
+                    tokio::spawn(take_submission(shared.clone(), data));
+                } else {
+                    tracing::debug!("ignored a packet sent to the propagation node");
+                }
+            }
+            Some(done) = events.resource_completions.recv() => {
+                if takes_sends {
+                    tokio::spawn(take_submission(shared.clone(), done.data));
+                }
+            }
             Some(_) = events.links_established.recv() => {}
             Some(_) = events.links_identified.recv() => {}
             Some(_) = events.link_packet_proofs.recv() => {}
@@ -536,6 +583,86 @@ async fn node_events(mut node: RegisteredDestination) {
             Some(_) = events.links_closed.recv() => {}
             else => break,
         }
+    }
+}
+
+/// A send from one of the user's apps: `[timestamp, [message + stamp, ...]]`,
+/// each message encrypted for its recipient. Each one with a good enough
+/// stamp is queued for the upstream node; one to the user is stored for
+/// the apps instead.
+async fn take_submission(shared: Arc<Shared>, data: Vec<u8>) {
+    let min_cost = lxmf_core::constants::PROPAGATION_COST.saturating_sub(lxmf_core::constants::PROPAGATION_COST_FLEX);
+    let checked = tokio::task::spawn_blocking(move || {
+        let (_, entries) =
+            lxmf_core::message::LxMessage::unpack_propagation_wrapper_owned(data.into(), SUBMISSION_LIMIT_BYTES)
+                .map_err(|e| e.to_string())?;
+        Ok::<_, String>(
+            entries
+                .iter()
+                .map(|entry| lxmf_core::stamper::validate_pn_stamp(entry, min_cost).map(|parts| parts.1))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await;
+    let entries = match checked {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(e)) => {
+            shared.counters.outgoing_refused.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("refused a send to the propagation node: {e}");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("checking a send failed: {e}");
+            return;
+        }
+    };
+    let address = shared.store.user_address();
+    let mut queued = false;
+    for entry in entries {
+        let Some(data) = entry else {
+            shared.counters.outgoing_refused.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("refused an outgoing message without a good enough stamp");
+            continue;
+        };
+        if data.len() <= 16 {
+            continue;
+        }
+        if data[..16] == address {
+            // To the user: keep it for the apps, as a message that came in.
+            let (identity, rings, ciphertext) = (shared.identity.clone(), shared.rings.clone(), data[16..].to_vec());
+            match tokio::task::spawn_blocking(move || ratchets::decrypt(&identity, &rings, &ciphertext)).await {
+                Ok(Ok(plaintext)) => {
+                    let mut full = address.to_vec();
+                    full.extend_from_slice(&plaintext);
+                    take_in(&shared, full, Via::Direct).await;
+                }
+                _ => tracing::warn!("a message to the user sent through the node could not be decrypted"),
+            }
+            continue;
+        }
+        let outbox = shared.outbox.clone();
+        let destination = hex::encode(&data[..16]);
+        match tokio::task::spawn_blocking(move || outbox.add(&data)).await {
+            Ok(Ok((Added::Queued, id))) => {
+                shared.counters.outgoing_queued.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    "queued outgoing message {} to {destination} for upstream",
+                    hex::encode(id)
+                );
+                queued = true;
+            }
+            Ok(Ok((Added::Duplicate, id))) => {
+                tracing::debug!("outgoing message {} is queued already", hex::encode(id));
+            }
+            Ok(Err(e)) => {
+                shared.counters.outgoing_refused.fetch_add(1, Ordering::Relaxed);
+                tracing::error!("could not queue an outgoing message to {destination}: {e}");
+            }
+            Err(e) => tracing::error!("queueing an outgoing message failed: {e}"),
+        }
+    }
+    if queued {
+        shared.outbox_ready.notify_one();
     }
 }
 
@@ -551,6 +678,10 @@ fn log_summary(summary: &Summary) {
 async fn write_status(shared: &Arc<Shared>, settings: &Settings) {
     let store = shared.store.clone();
     let summary = tokio::task::spawn_blocking(move || store.summary())
+        .await
+        .unwrap_or_default();
+    let outbox = shared.outbox.clone();
+    let outbox_count = tokio::task::spawn_blocking(move || outbox.summary().0)
         .await
         .unwrap_or_default();
     let c = &shared.counters;
@@ -574,6 +705,10 @@ async fn write_status(shared: &Arc<Shared>, settings: &Settings) {
         syncs_served: c.syncs_served.load(Ordering::Relaxed),
         syncs_refused: c.syncs_refused.load(Ordering::Relaxed),
         messages_served: c.messages_served.load(Ordering::Relaxed),
+        outgoing_queued: c.outgoing_queued.load(Ordering::Relaxed),
+        outgoing_refused: c.outgoing_refused.load(Ordering::Relaxed),
+        sent_upstream: c.sent_upstream.load(Ordering::Relaxed),
+        outbox: outbox_count,
         upstream: settings.upstream.map(hex::encode),
         last_upstream: shared.last_upstream.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         store: summary,

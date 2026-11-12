@@ -47,6 +47,13 @@ What it does:
   direct delivery failed may have left a message for you on their
   propagation node. The bouncer syncs from one you name, as you, and keeps
   what it finds the same way.
+- **Passes on what you send (with an upstream node).** An app that can't
+  reach someone directly hands the message to its propagation node, which
+  is the bouncer's. The bouncer checks its stamp, keeps it on disk, and
+  passes it to the upstream node, retrying every 5 minutes until that node
+  takes it (or `expiry_days` pass). The recipient collects it there when
+  they come online. The message is encrypted for the recipient; the bouncer
+  can't read it. Without an upstream node the bouncer takes nothing in.
 - **Doesn't peer.** The node announces itself as inactive, so other
   propagation nodes don't peer with it, and it never peers with them.
 - **Survives restarts.** The store is rsLXMF's on-disk propagation store
@@ -122,7 +129,7 @@ directory.
 | `[node] name` | none | Name the node announces. |
 | `[node] identity` | `state_dir/node_identity` | The node's identity file, created if missing. |
 | `[node] allowed_identities` | `[]` | Identity hashes (not addresses) allowed to sync besides yours. |
-| `[upstream] node` | none | A propagation node (`lxmf.propagation` hash) to fetch your messages from. |
+| `[upstream] node` | none | A propagation node (`lxmf.propagation` hash) to fetch your messages from, and to pass on what your apps send through the bouncer. |
 | `[upstream] interval_minutes` | `15` | Time between fetches. |
 | `[upstream] extra_ratchets` | `[]` | Ratchet files of apps that announced your address before the bouncer (see [Limits](#limits)). |
 
@@ -136,9 +143,10 @@ restarted until rnsd is up, and it reconnects if rnsd restarts.
 ## The apps
 
 Each app holds your identity, uses the bouncer's propagation node, syncs
-from it often, and never announces. Turn off "send via the propagation node
-when direct delivery fails": the bouncer's node only serves your messages
-and takes none in, so such a send fails (see [Limits](#limits)).
+from it often, and never announces. With an `[upstream] node` set, turn on
+"send via the propagation node when direct delivery fails": the bouncer
+passes such messages on. Without one, turn it off, since the bouncer's node
+then takes nothing in and the send fails.
 
 ### NomadNet
 
@@ -149,7 +157,8 @@ running). In `~/.nomadnetwork/config`, section `[client]`:
 announce_at_start = no
 # NomadNet has no "never": announce once every ten years.
 announce_interval = 5256000
-try_propagation_on_send_fail = no
+# yes with an [upstream] node in the bouncer, no without.
+try_propagation_on_send_fail = yes
 periodic_lxmf_sync = yes
 # Minutes (1 at least).
 lxmf_sync_interval = 5
@@ -181,7 +190,7 @@ keeps its history per identity, under `storage/identities/<identity hash>`).
 Then, in the web UI:
 
 - sidebar, **Announce**: *Disabled*; don't press *Announce Now*;
-- Settings, **Auto send to propagation node**: off;
+- Settings, **Auto send to propagation node**: on with an `[upstream] node`, off without;
 - Settings, Propagation Nodes, **Local Propagation Node**: off;
 - **Preferred Propagation Node**: the bouncer's propagation node hash;
 - **Auto Sync Interval**: *Every 15 Minutes* (the shortest the UI offers).
@@ -191,7 +200,7 @@ The same through its API, with a shorter sync interval:
 ```
 curl -X PATCH http://127.0.0.1:8000/api/v1/config -H 'Content-Type: application/json' -d '{
   "auto_announce_interval_seconds": 0,
-  "auto_send_failed_messages_to_propagation_node": false,
+  "auto_send_failed_messages_to_propagation_node": true,
   "lxmf_preferred_propagation_node_destination_hash": "<bouncer propagation node hash>",
   "lxmf_preferred_propagation_node_auto_sync_interval_seconds": 300
 }'
@@ -205,7 +214,7 @@ print(base64.b32encode(open(sys.argv[1],"rb").read()).decode())' <identity file>
 then in Preferences:
 
 - **Announce automatically**: off;
-- **Try propagation automatically**: off;
+- **Try propagation automatically**: on with an `[upstream] node`, off without;
 - **Send via Propagation Node by default**: off;
 - **LXMF Propagation Node**: the bouncer's propagation node hash;
 - **Sync with Propagation Node periodically**: on, with the shortest
@@ -243,6 +252,7 @@ lxmf-bouncer status (updated 12 s ago)
     <sender address>  3
   since start        2 direct, 1 from upstream, 0 duplicate(s), 0 dropped
   clients            6 message(s) served in 3 sync(s), 1 refused
+  outgoing           0 waiting; since start 2 queued, 2 passed upstream, 0 refused
   upstream           <node>, last fetch 4 min ago: ok, 0 new
 ```
 
@@ -257,11 +267,14 @@ lxmf-bouncer status (updated 12 s ago)
 - **Messages arrive at the speed of each app's sync**, not the instant
   they're sent. Senders see "delivered" when the bouncer has the message,
   before any of your apps show it.
-- **Sending through a propagation node doesn't work while the bouncer is
-  your node.** Apps have one propagation node setting, used both to
-  collect and to send, and the bouncer's node takes nothing in. Messages to
-  people who are offline fail instead of waiting on a node. To send one,
-  switch the app to a public node for that message, and back.
+- **A message sent through the bouncer reaches people who collect from the
+  upstream node's network.** The bouncer passes it to one node, the
+  upstream; a recipient whose app syncs from a node that doesn't peer with
+  it won't find it. The app shows such a message as sent (to a node), not
+  delivered.
+- **Without an upstream node, sending through a propagation node doesn't
+  work.** Apps have one propagation node setting, used both to collect and
+  to send, and the bouncer's node then takes nothing in.
 - **An app that is online still answers path requests for your address.**
   Reticulum answers a path request for any destination registered locally,
   announce or no announce. A sender asking for a path at that moment may
@@ -280,8 +293,12 @@ lxmf-bouncer status (updated 12 s ago)
   `<storage>/lxmf/ratchets/<your LXMF address>.ratchets`, e.g.
   `~/.nomadnetwork/storage/lxmf/ratchets/…`). Opportunistic packets
   encrypted to an old ratchet can't be read and are lost.
-- **No stamp cost.** The bouncer asks senders for no stamp, so it has no
-  proof-of-work spam defence.
+- **No stamp cost for messages to you.** The bouncer asks senders for no
+  stamp, so it has no proof-of-work spam defence there.
+- **Anyone can send through the node.** Like any propagation node it can't
+  tell who hands it a message (apps don't identify to send), so it takes
+  one from anyone who knows its hash and pays its stamp cost (16, as Python
+  LXMF's default). At most 50 MB waits at once.
 - **Unknown senders are kept unverified.** If the bouncer hasn't heard the
   sender's announce it stores the message without checking its signature;
   your apps check it once they know the sender.

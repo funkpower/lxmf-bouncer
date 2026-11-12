@@ -11,7 +11,8 @@ picks the Python environment.
   S  a sender (Python LXMF), online throughout
   C1, C2, C3  Python LXMF clients holding U, syncing from the bouncer
   X  an identity the bouncer does not allow
-  P  a Python propagation node holding a message for U (the upstream)
+  P  a Python propagation node holding a message for U (the upstream),
+     and taking the messages U's clients send through the bouncer
 """
 
 import argparse
@@ -134,13 +135,15 @@ class Run:
             time.sleep(0.5)
         return None
 
-    def client(self, name, identity, pn, know=(), reply_to=None, reply=None, timeout=150):
+    def client(self, name, identity, pn, know=(), reply_to=None, reply=None, send_to=None, send=None, timeout=200):
         out = self.path(f"{name}.json")
         extra = ["--pn", pn, "--out", out]
         for k in know:
             extra += ["--know", k]
         if reply_to:
             extra += ["--reply-to", reply_to, "--reply", reply]
+        if send_to:
+            extra += ["--send-to", send_to, "--send", send]
         argv, _ = self.peer("client", name, identity, *extra)
         proc = self.start(name, argv)
         try:
@@ -303,11 +306,27 @@ def main():
         check(f"stored message {m3['hash']}" not in later and "upstream fetch from" not in later,
               "nothing fetched twice (P dropped the message once the bouncer held it)")
 
+        print("C1 sends S a message through the bouncer, which passes it to P", flush=True)
+        offset = run.log_size("bouncer")
+        c1s = run.client("C1", run.path("ids", "U"), node, know=[S["delivery"]],
+                         send_to=S["delivery"], send="sent through the bouncer")
+        check(c1s["sent"]["ok"] and c1s["sent"]["state"] == 0x04, "the bouncer's node took C1's message (SENT)")
+        check(run.wait_log("bouncer", f"queued outgoing message", 30, after=offset), "the bouncer queued it")
+        check(run.wait_log("bouncer", f"passed outgoing message", 120, after=offset), "the bouncer passed it to P")
+        sender.stdin.write((json.dumps({"sync": P["propagation"], "id": "sync P"}) + "\n").encode())
+        sender.stdin.flush()
+        synced = run.wait_event("S", lambda e: e["event"] == "synced" and e.get("id") == "sync P", 90)
+        check(synced is not None and synced["state"] == 0x07, "S synced from P")
+        got = run.wait_event("S", lambda e: e["event"] == "received" and e.get("hash") == c1s["sent"]["hash"], 10)
+        check(got is not None and got["content"] == "sent through the bouncer", "S, syncing from P, got C1's message")
+        check(got["source"] == U["delivery"] and got["signature_validated"], "it is from U, signature valid")
+
         run.stop("bouncer")
         status = subprocess.run([args.bouncer, "--config", run.config, "status", "--json"], capture_output=True, text=True, check=True).stdout
         status = json.loads(status)
         check(status["store"]["messages"] == 3 and status["store"]["by_sender"] == {S["delivery"]: 3},
               "`status` shows 3 messages from S")
+        check(status["outbox"] == 0 and status["sent_upstream"] == 1, "`status` shows the send passed upstream, none waiting")
 
         print("the bouncer as a client of a local shared instance (a Python rnsd)", flush=True)
         instance = f"lxmfb-e2e-{run.port}"
