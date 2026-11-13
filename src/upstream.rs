@@ -13,9 +13,9 @@
 //! sends a propagated message (`[timestamp, [message + stamp]]` in a
 //! Resource over a Link), with a stamp meeting the upstream node's cost.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lxmf_core::constants::MESSAGE_GET_PATH;
 use rmpv::Value;
@@ -37,6 +37,26 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DOWNLOAD_LIMIT_KB: f64 = 1000.0;
 /// Downloads in one fetch, at most.
 const MAX_ROUNDS: usize = 100;
+/// A message that could not be opened is tried again after this long (a
+/// ratchet file may have been added meanwhile).
+const SKIP_FOR: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Messages on upstream nodes not to fetch again yet, with when each was
+/// set aside.
+#[derive(Default)]
+struct Skip(HashMap<Vec<u8>, Instant>);
+
+impl Skip {
+    fn insert(&mut self, id: Vec<u8>) {
+        self.0.insert(id, Instant::now());
+    }
+    fn contains(&self, id: &[u8]) -> bool {
+        self.0.get(id).is_some_and(|at| at.elapsed() < SKIP_FOR)
+    }
+    fn expire(&mut self) {
+        self.0.retain(|_, at| at.elapsed() < SKIP_FOR);
+    }
+}
 
 fn encode(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
@@ -69,12 +89,12 @@ async fn get(handle: &LinkSessionHandle, request: Value) -> Result<Value, String
     }
 }
 
-/// Fetch every `interval`, for as long as the bouncer runs.
-pub async fn run(shared: Arc<Shared>, node: [u8; 16], interval: Duration) {
+/// Fetch from each node every `interval`, for as long as the bouncer runs.
+pub async fn run(shared: Arc<Shared>, nodes: Vec<[u8; 16]>, interval: Duration) {
     tokio::time::sleep(FIRST_FETCH_DELAY).await;
     // Messages that could not be opened stay on the node; don't fetch them
     // again each time.
-    let mut skip: HashSet<Vec<u8>> = HashSet::new();
+    let mut skip = Skip::default();
     let user = Holder {
         identity: shared.identity.clone(),
         address: shared.store.user_address(),
@@ -90,21 +110,29 @@ pub async fn run(shared: Arc<Shared>, node: [u8; 16], interval: Duration) {
         }))
         .collect();
     loop {
+        skip.expire();
         let mut result = UpstreamResult::default();
-        for holder in &holders {
-            let one = fetch(&shared, node, holder, &mut skip).await;
-            result.at = one.at;
-            result.stored += one.stored;
-            result.duplicates += one.duplicates;
-            result.failed += one.failed;
-            if result.error.is_none() {
-                result.error = one.error.map(|e| {
-                    if holder.old {
-                        format!("for old address {}: {e}", hex::encode(holder.address))
-                    } else {
-                        e
-                    }
-                });
+        for &node in &nodes {
+            for holder in &holders {
+                let one = fetch(&shared, node, holder, &mut skip).await;
+                result.at = one.at;
+                result.stored += one.stored;
+                result.duplicates += one.duplicates;
+                result.failed += one.failed;
+                if result.error.is_none() {
+                    result.error = one.error.map(|e| {
+                        let e = if holder.old {
+                            format!("for old address {}: {e}", hex::encode(holder.address))
+                        } else {
+                            e
+                        };
+                        if nodes.len() > 1 {
+                            format!("{}: {e}", hex::encode(node))
+                        } else {
+                            e
+                        }
+                    });
+                }
             }
         }
         result.ok = result.error.is_none();
@@ -116,7 +144,7 @@ pub async fn run(shared: Arc<Shared>, node: [u8; 16], interval: Duration) {
                 result.failed
             ),
             None => tracing::debug!("upstream fetch: nothing new"),
-            Some(e) => tracing::warn!("upstream fetch from {} failed: {e}", hex::encode(node)),
+            Some(e) => tracing::warn!("upstream fetch failed: {e}"),
         }
         *shared.last_upstream.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         tokio::time::sleep(interval).await;
@@ -131,7 +159,7 @@ struct Holder {
     old: bool,
 }
 
-async fn fetch(shared: &Arc<Shared>, node: [u8; 16], holder: &Holder, skip: &mut HashSet<Vec<u8>>) -> UpstreamResult {
+async fn fetch(shared: &Arc<Shared>, node: [u8; 16], holder: &Holder, skip: &mut Skip) -> UpstreamResult {
     let mut result = UpstreamResult {
         at: now(),
         ..UpstreamResult::default()
@@ -174,7 +202,7 @@ async fn fetch_on(
     shared: &Arc<Shared>,
     handle: &LinkSessionHandle,
     holder: &Holder,
-    skip: &mut HashSet<Vec<u8>>,
+    skip: &mut Skip,
     result: &mut UpstreamResult,
 ) -> Result<(), String> {
     let Value::Array(listed) = get(handle, Value::Array(vec![Value::Nil, Value::Nil])).await? else {
@@ -258,18 +286,20 @@ async fn fetch_on(
     Ok(())
 }
 
-/// Pass queued outgoing messages to the upstream node: when one is queued,
-/// and every few minutes while any wait.
-pub async fn forward_loop(shared: Arc<Shared>, node: [u8; 16]) {
+/// Pass messages queued for upstream node `index` to it: when one is
+/// queued, and every few minutes while any wait.
+pub async fn forward_loop(shared: Arc<Shared>, index: usize) {
     tokio::time::sleep(FIRST_FETCH_DELAY).await;
+    let queue = &shared.upstreams[index];
+    let node = queue.node;
     loop {
-        let outbox = shared.outbox.clone();
+        let outbox = queue.outbox.clone();
         let pending = tokio::task::spawn_blocking(move || outbox.pending())
             .await
             .unwrap_or_default();
         if !pending.is_empty() {
             let waiting = pending.len();
-            match forward(&shared, node, pending).await {
+            match forward(&shared, index, pending).await {
                 Ok(sent) if sent == waiting => {}
                 Ok(sent) => {
                     tracing::warn!("passed {sent} of {waiting} outgoing message(s) upstream; retrying the rest later")
@@ -282,13 +312,15 @@ pub async fn forward_loop(shared: Arc<Shared>, node: [u8; 16]) {
             }
         }
         tokio::select! {
-            _ = shared.outbox_ready.notified() => {}
+            _ = queue.ready.notified() => {}
             _ = tokio::time::sleep(FORWARD_RETRY) => {}
         }
     }
 }
 
-async fn forward(shared: &Arc<Shared>, node: [u8; 16], pending: Vec<crate::outbox::Queued>) -> Result<usize, String> {
+async fn forward(shared: &Arc<Shared>, index: usize, pending: Vec<crate::outbox::Queued>) -> Result<usize, String> {
+    let queue = &shared.upstreams[index];
+    let node = queue.node;
     shared
         .runtime
         .await_path(node, PATH_TIMEOUT)
@@ -346,7 +378,7 @@ async fn forward(shared: &Arc<Shared>, node: [u8; 16], pending: Vec<crate::outbo
         };
         match tokio::time::timeout(RESOURCE_TIMEOUT, transfer.concluded()).await {
             Ok(Ok(_)) => {
-                let outbox = shared.outbox.clone();
+                let outbox = queue.outbox.clone();
                 let _ = tokio::task::spawn_blocking(move || outbox.remove(&id)).await;
                 shared
                     .counters

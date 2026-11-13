@@ -7,13 +7,16 @@ identities under the work directory. Nothing touches a shared instance or
 any other network. Run through tests/e2e.sh, which builds the bouncer and
 picks the Python environment.
 
-  U  the user's identity, held by the bouncer
-  O  an identity U had before, also held by the bouncer
+  U  the user's identity, held by the bouncer (stamp cost 4, enforced)
+  O  an identity U had before, also held by the bouncer, which tells
+     people writing to it U's address
   S  a sender (Python LXMF), online throughout
+  T  a sender that announces once, while the bouncer is down
   C1, C2, C3  Python LXMF clients holding U, syncing from the bouncer
   X  an identity the bouncer does not allow
   P  a Python propagation node holding a message for U (the upstream),
      and taking the messages U's clients send through the bouncer
+  Q  a second upstream propagation node
 """
 
 import argparse
@@ -156,7 +159,7 @@ class Run:
         with open(out) as f:
             return json.load(f)
 
-    def bouncer_config(self, upstream, reticulum=None):
+    def bouncer_config(self, upstreams, reticulum=None):
         path = self.path("bouncer.toml")
         reticulum = reticulum or f'tcp = "127.0.0.1:{self.port}"'
         with open(path, "w") as f:
@@ -165,8 +168,10 @@ class Run:
                     f'[reticulum]\n{reticulum}\n\n'
                     f'[announce]\ninterval_minutes = 30\n\n'
                     f'[node]\nname = "e2e bouncer"\n\n'
-                    f'[upstream]\nnode = "{upstream}"\ninterval_minutes = 1\n\n'
-                    f'[[old_identity]]\nidentity = "{self.path("ids", "O")}"\n')
+                    f'[upstream]\nnode = {json.dumps(upstreams)}\ninterval_minutes = 1\n'
+                    f'extra_ratchets = ["{self.path("app.ratchets")}"]\n\n'
+                    f'[stamps]\ncost = 4\nenforce = true\n\n'
+                    f'[[old_identity]]\nidentity = "{self.path("ids", "O")}"\nnotify_senders = true\n')
         return path
 
     def start_bouncer(self):
@@ -179,6 +184,16 @@ class Run:
 
 def make_identity(python, path):
     subprocess.run([python, "-c", "import RNS,sys; RNS.Identity().to_file(sys.argv[1])", path], check=True)
+
+
+def app_ratchets(python, identity, path):
+    """A ratchet file as a Python LXMF app keeps one; returns its newest
+    ratchet's public key (hex)."""
+    code = ("import RNS,sys; from RNS.vendor import umsgpack; i=RNS.Identity.from_file(sys.argv[1]); "
+            "r=[RNS.Identity._generate_ratchet() for _ in range(2)]; p=umsgpack.packb(r); "
+            "open(sys.argv[2],'wb').write(umsgpack.packb({'signature': i.sign(p), 'ratchets': p})); "
+            "print(RNS.Identity._ratchet_public_bytes(r[0]).hex())")
+    return subprocess.run([python, "-c", code, identity, path], check=True, capture_output=True, text=True).stdout.strip()
 
 
 def hashes(python, identity):
@@ -205,17 +220,20 @@ def main():
     print(f"work directory {args.work}, private network on 127.0.0.1:{run.port}", flush=True)
     try:
         ids = {}
-        for name in ["U", "S", "X", "P", "O"]:
+        for name in ["U", "S", "X", "P", "O", "Q", "T"]:
             make_identity(args.python, run.path("ids", name))
             ids[name] = hashes(args.python, run.path("ids", name))
-        U, S, P, O = ids["U"], ids["S"], ids["P"], ids["O"]
+        U, S, P, O, Q, T = ids["U"], ids["S"], ids["P"], ids["O"], ids["Q"], ids["T"]
+        old_ratchet = app_ratchets(args.python, run.path("ids", "U"), run.path("app.ratchets"))
 
         print("starting the network, the bouncer and the sender", flush=True)
         hub = rns_config(run.path("rns", "hub"), run.port, server=True)
         run.start("hub", [args.rnsd, "--config", hub, "-v"])
         time.sleep(3)
-        run.config = run.bouncer_config(P["propagation"])
+        upstreams = [P["propagation"], Q["propagation"]]
+        run.config = run.bouncer_config(upstreams)
         run.start_bouncer()
+        check(run.wait_log("bouncer", "added 2 ratchet(s) of apps", 5), "the app's ratchets were added to U's ring")
         hashes_out = subprocess.run([args.bouncer, "--config", run.config, "hashes"], capture_output=True, text=True, check=True).stdout
         node = hashes_out.split("propagation node")[1].split()[0]
         check(U["delivery"] in hashes_out and len(node) == 32 and node != U["propagation"],
@@ -226,8 +244,9 @@ def main():
         sender = run.start("S", argv, stdin=subprocess.PIPE)
         check(run.wait_event("S", lambda e: e["event"] == "ready", 30) is not None, "sender S is up")
 
-        def send(content, method, title="", pn=None, timeout=120, to=None):
-            command = {"to": to or U["delivery"], "content": content, "title": title, "method": method, "id": content}
+        def send(content, method, title="", pn=None, timeout=120, to=None, stamp=True):
+            command = {"to": to or U["delivery"], "content": content, "title": title, "method": method, "id": content,
+                       "stamp": stamp}
             if pn:
                 command["pn"] = pn
             sender.stdin.write((json.dumps(command) + "\n").encode())
@@ -282,6 +301,9 @@ def main():
         check(len(moved) == 1 and moved[0]["source"] == S["delivery"] and moved[0]["destination"] == U["delivery"],
               "C1 got it, from S, addressed to U")
         check(not moved[0]["signature_validated"], "its signature no longer matches (it was sent to O)")
+        told = run.wait_event("S", lambda e: e["event"] == "received" and e["source"] == O["delivery"], 60)
+        check(told is not None and U["delivery"] in told["content"] and told["signature_validated"],
+              "S was told U's address, in a message signed by O")
 
         print("X (not allowed) tries to sync from the bouncer", flush=True)
         x = run.client("X", run.path("ids", "X"), node)
@@ -290,7 +312,10 @@ def main():
         print("P, an ordinary propagation node, takes a message for U from S", flush=True)
         argv, _ = run.peer("pnode", "P", run.path("ids", "P"), "--events", run.path("P.events"))
         run.start("P", argv)
+        argv, _ = run.peer("pnode", "Q", run.path("ids", "Q"), "--events", run.path("Q.events"))
+        run.start("Q", argv)
         check(run.wait_event("P", lambda e: e["event"] == "ready", 30) is not None, "P is up")
+        check(run.wait_event("Q", lambda e: e["event"] == "ready", 30) is not None, "Q is up")
         time.sleep(3)
         m3 = send("third message, via a propagation node", "propagated", pn=P["propagation"], timeout=180)
         check(m3["ok"], "S handed the message to P")
@@ -322,7 +347,7 @@ def main():
         time.sleep(1)
         with open(run.path("bouncer.log"), "rb") as f:
             later = f.read()[offset:].decode("utf-8", "replace")
-        check(f"stored message {m3['hash']}" not in later and "upstream fetch from" not in later,
+        check(f"stored message {m3['hash']}" not in later and "upstream fetch failed" not in later,
               "nothing fetched twice (P dropped the message once the bouncer held it)")
 
         print("C1 sends S a message through the bouncer, which passes it to P", flush=True)
@@ -331,7 +356,8 @@ def main():
                          send_to=S["delivery"], send="sent through the bouncer")
         check(c1s["sent"]["ok"] and c1s["sent"]["state"] == 0x04, "the bouncer's node took C1's message (SENT)")
         check(run.wait_log("bouncer", f"queued outgoing message", 30, after=offset), "the bouncer queued it")
-        check(run.wait_log("bouncer", f"passed outgoing message", 120, after=offset), "the bouncer passed it to P")
+        check(run.wait_log("bouncer", f"to {P['propagation']}", 120, after=offset), "the bouncer passed it to P")
+        check(run.wait_log("bouncer", f"to {Q['propagation']}", 120, after=offset), "and to Q")
         sender.stdin.write((json.dumps({"sync": P["propagation"], "id": "sync P"}) + "\n").encode())
         sender.stdin.flush()
         synced = run.wait_event("S", lambda e: e["event"] == "synced" and e.get("id") == "sync P", 90)
@@ -345,11 +371,12 @@ def main():
         status = json.loads(status)
         check(status["store"]["messages"] == 5 and status["store"]["by_sender"] == {S["delivery"]: 5},
               "`status` shows 5 messages from S")
-        check(status["outbox"] == 0 and status["sent_upstream"] == 1, "`status` shows the send passed upstream, none waiting")
+        check(status["outbox"] == 0 and status["sent_upstream"] == 2,
+              "`status` shows the send passed to both upstream nodes, none waiting")
 
         print("the bouncer as a client of a local shared instance (a Python rnsd)", flush=True)
         instance = f"lxmfb-e2e-{run.port}"
-        run.config = run.bouncer_config(P["propagation"], f'shared_instance = true\ninstance_name = "{instance}"')
+        run.config = run.bouncer_config(upstreams, f'shared_instance = true\ninstance_name = "{instance}"')
         refused = subprocess.run([args.bouncer, "--config", run.config, "run"], capture_output=True, text=True, timeout=30)
         check(refused.returncode != 0 and "no Reticulum shared instance" in refused.stderr,
               "with no shared instance running, the bouncer refuses to start (rather than become one)")
@@ -359,6 +386,11 @@ def main():
             f.write(f"[reticulum]\n  enable_transport = No\n  share_instance = Yes\n  instance_name = {instance}\n\n"
                     f"[logging]\n  loglevel = 4\n\n[interfaces]\n  [[e2e uplink]]\n    type = TCPClientInterface\n"
                     f"    enabled = Yes\n    target_host = 127.0.0.1\n    target_port = {run.port}\n")
+        argv, _ = run.peer("sender", "T", run.path("ids", "T"), "--events", run.path("T.events"), "--announce-once")
+        silent = run.start("T", argv, stdin=subprocess.PIPE)
+        check(run.wait_event("T", lambda e: e["event"] == "ready", 30) is not None,
+              "T is up and announced once, while the bouncer is down")
+        time.sleep(3)
         run.start("shared", [args.rnsd, "--config", shared])
         time.sleep(4)
         run.start_bouncer()
@@ -371,6 +403,36 @@ def main():
         check(m5["ok"], "S handed another message to P")
         check(run.wait_log("bouncer", f"stored message {m5['hash']}", 150, after=offset),
               "the bouncer fetched it from P through the shared instance")
+
+        print("S sends to a ratchet an app of U's announced before the bouncer", flush=True)
+        sender.stdin.write((json.dumps({"ratchet": old_ratchet, "for": U["delivery"], "id": "ratchet"}) + "\n").encode())
+        sender.stdin.flush()
+        check(run.wait_event("S", lambda e: e["event"] == "ratchet set", 10) is not None, "S now uses the app's ratchet")
+        m6 = send("sixth message, one packet to an app's old ratchet", "opportunistic")
+        check(m6["ok"] and run.wait_log("bouncer", f"stored message {m6['hash']}", 30, after=offset),
+              "the bouncer read and stored it")
+
+        print("S sends without a stamp", flush=True)
+        m7 = send("seventh message, no stamp", "direct", stamp=False)
+        check(run.wait_log("bouncer", "no stamp of cost 4", 30, after=offset) and
+              f"stored message {m7['hash']}" not in open(run.path("bouncer.log"), errors="replace").read(),
+              "the bouncer dropped it")
+
+        print("Q, the second upstream node, takes a message for U", flush=True)
+        m8 = send("eighth message, via Q", "propagated", pn=Q["propagation"], timeout=180)
+        check(m8["ok"] and run.wait_log("bouncer", f"stored message {m8['hash']}", 150, after=offset),
+              "the bouncer fetched it from Q")
+
+        print("T, whose one announce the bouncer missed, writes to U", flush=True)
+        silent.stdin.write((json.dumps({"to": U["delivery"], "content": "from T", "method": "direct", "id": "t"}) + "\n").encode())
+        silent.stdin.flush()
+        mt = run.wait_event("T", lambda e: e["event"] == "sent" and e.get("id") == "t", 120)
+        check(mt is not None and mt["ok"], "T's message delivered")
+        check(run.wait_log("bouncer", f"stored message {mt['hash']} from {T['delivery']} (direct, verified", 30, after=offset),
+              "the bouncer found T's key on the network and verified the signature")
+
+        notices = [e for e in run.events("S") if e["event"] == "received" and e["source"] == O["delivery"]]
+        check(len(notices) == 1, "S was told about U's address once, for all its messages to O")
         print("PASS", flush=True)
         return 0
     except Failure as e:

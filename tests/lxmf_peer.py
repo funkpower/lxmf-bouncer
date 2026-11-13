@@ -78,10 +78,12 @@ METHODS = {
 }
 
 
-def send_message(router, source, to_hex, title, content, method, pn_hex=None, timeout=90):
+def send_message(router, source, to_hex, title, content, method, pn_hex=None, timeout=90, stamp=True):
     to = bytes.fromhex(to_hex)
     if not ensure_identity_known(to):
         return {"ok": False, "error": "recipient identity unknown"}
+    # Without the stamp cost the recipient announced, LXMF sends no stamp.
+    hidden = None if stamp else router.outbound_stamp_costs.pop(to, None)
     if pn_hex:
         pn = bytes.fromhex(pn_hex)
         router.set_outbound_propagation_node(pn)
@@ -97,6 +99,8 @@ def send_message(router, source, to_hex, title, content, method, pn_hex=None, ti
     if method == "opportunistic":
         done.add(LXMF.LXMessage.SENT)
     wait_for(lambda: message.state in done, timeout)
+    if hidden is not None:
+        router.outbound_stamp_costs[to] = hidden
     ok = message.state in done and message.state not in {LXMF.LXMessage.FAILED, LXMF.LXMessage.REJECTED, LXMF.LXMessage.CANCELLED}
     return {"ok": ok, "state": message.state, "hash": message.hash.hex() if message.hash else None,
             "method": method, "content": content, "title": title}
@@ -117,15 +121,17 @@ def run_sender(args):
         emit(args.events, {"event": "received", **describe(message)})
 
     router.register_delivery_callback(delivered)
-    router.announce(source.hash)
     emit(args.events, {"event": "ready", "address": source.hash.hex()})
 
     def announcer():
         while True:
-            time.sleep(15)
             router.announce(source.hash)
+            time.sleep(15)
 
-    threading.Thread(target=announcer, daemon=True).start()
+    if args.announce_once:
+        router.announce(source.hash)
+    else:
+        threading.Thread(target=announcer, daemon=True).start()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -145,8 +151,14 @@ def run_sender(args):
                                "state": router.propagation_transfer_state})
             router.acknowledge_sync_completion(reset_state=True)
             continue
+        if "ratchet" in command:
+            # As if this sender had last heard the recipient announce this ratchet.
+            RNS.Identity._remember_ratchet(bytes.fromhex(command["for"]), bytes.fromhex(command["ratchet"]))
+            emit(args.events, {"event": "ratchet set", "id": command.get("id")})
+            continue
         result = send_message(router, source, command["to"], command.get("title", ""), command["content"],
-                              command.get("method", "direct"), command.get("pn"))
+                              command.get("method", "direct"), command.get("pn"),
+                              stamp=command.get("stamp", True))
         emit(args.events, {"event": "sent", "id": command.get("id"), **result})
     # stdin closed: keep receiving until killed.
     while True:
@@ -225,6 +237,7 @@ def main():
     parser.add_argument("--reply")
     parser.add_argument("--send-to")
     parser.add_argument("--send")
+    parser.add_argument("--announce-once", action="store_true")
     args = parser.parse_args()
     {"sender": run_sender, "client": run_client, "pnode": run_pnode}[args.role](args)
 

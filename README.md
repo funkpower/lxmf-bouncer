@@ -35,7 +35,9 @@ What it does:
   address (with your display name, and ratchets as Python LXMF does) at
   start and every `interval_minutes`, and takes direct (Link) and
   opportunistic deliveries. Signatures are checked when the sender's key is
-  known; forged messages are dropped.
+  known (a sender it hasn't heard of is looked up on the network first);
+  forged messages are dropped. Apps that announced your address before
+  can be listed, and messages encrypted to their ratchets are read too.
 - **Serves every app its own copy.** Its propagation node answers `/get`
   only for identities you allow (your own, plus any you list). A
   propagation node normally deletes a message once a client says it has it;
@@ -43,14 +45,14 @@ What it does:
   app gets one. Apps remember which messages they already have, so a sync
   downloads only new ones. Messages keep their original source and
   signature, so replies go to the sender.
-- **Fetches from another propagation node too (optional).** A sender whose
+- **Fetches from other propagation nodes too (optional).** A sender whose
   direct delivery failed may have left a message for you on their
-  propagation node. The bouncer syncs from one you name, as you, and keeps
-  what it finds the same way.
+  propagation node. The bouncer syncs from the ones you name, as you, and
+  keeps what it finds the same way.
 - **Passes on what you send (with an upstream node).** An app that can't
   reach someone directly hands the message to its propagation node, which
   is the bouncer's. The bouncer checks its stamp, keeps it on disk, and
-  passes it to the upstream node, retrying every 5 minutes until that node
+  passes it to each upstream node, retrying every 5 minutes until each
   takes it (or `expiry_days` pass). The recipient collects it there when
   they come online. The message is encrypted for the recipient; the bouncer
   can't read it. Without an upstream node the bouncer takes nothing in.
@@ -61,7 +63,13 @@ What it does:
   and moves them to your address so your apps can open them. They show in
   the sender's conversation, and your reply goes to the sender from your
   current address. Because the sender signed the old address, apps mark
-  these messages' signatures as invalid (NomadNet: "Invalid Signature").
+  these messages' signatures as invalid (NomadNet: "Invalid Signature");
+  the bouncer checks them against the old address before moving them.
+  With `notify_senders` it also sends each such sender, once, a message
+  from the old address giving your current one.
+- **Asks senders for proof of work (optional).** With a `[stamps]` cost,
+  your address announces it, as Python LXMF does, and with `enforce`
+  messages without a good enough stamp are dropped.
 - **Doesn't peer.** The node announces itself as inactive, so other
   propagation nodes don't peer with it, and it never peers with them.
 - **Survives restarts.** The store is rsLXMF's on-disk propagation store
@@ -137,11 +145,14 @@ directory.
 | `[node] name` | none | Name the node announces. |
 | `[node] identity` | `state_dir/node_identity` | The node's identity file, created if missing. |
 | `[node] allowed_identities` | `[]` | Identity hashes (not addresses) allowed to sync besides yours. |
-| `[upstream] node` | none | A propagation node (`lxmf.propagation` hash) to fetch your messages from, and to pass on what your apps send through the bouncer. |
+| `[upstream] node` | none | A propagation node (`lxmf.propagation` hash), or a list, to fetch your messages from and to pass on what your apps send through the bouncer. |
 | `[upstream] interval_minutes` | `15` | Time between fetches. |
-| `[upstream] extra_ratchets` | `[]` | Ratchet files of apps that announced your address before the bouncer (see [Limits](#limits)). |
+| `[upstream] extra_ratchets` | `[]` | Ratchet files of apps that announced your address before the bouncer (Python LXMF keeps them at `<storage>/lxmf/ratchets/<your LXMF address>.ratchets`). Added to the bouncer's own ratchets at start. |
+| `[stamps] cost` | none | Stamp cost announced with your address (1 to 254). |
+| `[stamps] enforce` | `false` | Drop messages to you without a stamp of that cost. |
 | `[[old_identity]] identity` | none | An identity you used before; repeat the table for more. |
 | `[[old_identity]] extra_ratchets` | `[]` | Ratchet files of apps that announced that old address. |
+| `[[old_identity]] notify_senders` | `false` | Tell each person who writes to the old address, once, your current one. |
 
 Set exactly one of `shared_instance`, `tcp` or `config_dir`. With
 `shared_instance` or `tcp` the bouncer writes its own Reticulum config to
@@ -271,17 +282,18 @@ lxmf-bouncer status (updated 12 s ago)
 ## Limits
 
 - **Your own sent messages stay in the app you sent them from.** The other
-  apps never see them; their history shows only what you received.
+  apps never see them; their history shows only what you received. A sent
+  message is encrypted for its recipient, so the bouncer can't read it.
 - **Read state isn't shared**, and a new app (or one reset) downloads every
-  message still held, up to `expiry_days` back.
+  message still held, up to `expiry_days` back. Every app syncs as the
+  same identity, so the node can't tell them apart.
 - **Messages arrive at the speed of each app's sync**, not the instant
-  they're sent. Senders see "delivered" when the bouncer has the message,
-  before any of your apps show it.
-- **A message sent through the bouncer reaches people who collect from the
-  upstream node's network.** The bouncer passes it to one node, the
-  upstream; a recipient whose app syncs from a node that doesn't peer with
-  it won't find it. The app shows such a message as sent (to a node), not
-  delivered.
+  they're sent: a propagation node can't push. Senders see "delivered" when
+  the bouncer has the message, before any of your apps show it.
+- **A message sent through the bouncer reaches people who collect from an
+  upstream node's network.** A recipient whose app syncs from a node that
+  peers with none of the upstream nodes won't find it. The app shows such a
+  message as sent (to a node), not delivered.
 - **Without an upstream node, sending through a propagation node doesn't
   work.** Apps have one propagation node setting, used both to collect and
   to send, and the bouncer's node then takes nothing in.
@@ -297,30 +309,31 @@ lxmf-bouncer status (updated 12 s ago)
 - **Old ratchets.** Senders encrypt opportunistic and propagated messages
   to the newest ratchet they heard for you. Until they hear the bouncer's
   announce, that may be one of an app that announced your address before.
-  Direct (Link) deliveries don't use ratchets and are unaffected. For
-  messages fetched from the upstream node, list those apps' ratchet files in
-  `extra_ratchets` (Python LXMF keeps them at
-  `<storage>/lxmf/ratchets/<your LXMF address>.ratchets`, e.g.
-  `~/.nomadnetwork/storage/lxmf/ratchets/…`). Opportunistic packets
-  encrypted to an old ratchet can't be read and are lost.
-- **No stamp cost for messages to you.** The bouncer asks senders for no
-  stamp, so it has no proof-of-work spam defence there.
+  Only the ratchet files listed in `extra_ratchets` are known to the
+  bouncer; a message encrypted to any other app's ratchet can't be read.
+  An opportunistic one is lost; a propagated one stays on the upstream node
+  and is tried again every 6 hours, so adding the file later still gets it.
 - **Anyone can send through the node.** Like any propagation node it can't
   tell who hands it a message (apps don't identify to send), so it takes
   one from anyone who knows its hash and pays its stamp cost (16, as Python
-  LXMF's default). At most 50 MB waits at once.
-- **Unknown senders are kept unverified.** If the bouncer hasn't heard the
-  sender's announce it stores the message without checking its signature;
-  your apps check it once they know the sender.
-- **Messages an upstream fetch can't decrypt stay on the upstream node**
-  (and are logged); they aren't fetched again until the bouncer restarts.
+  LXMF's default). At most 50 MB waits for each upstream node.
+- **Stamps and tickets.** Apps can give contacts tickets that stand in for
+  a stamp. The bouncer doesn't see them, so with `enforce` a contact's
+  ticket-stamped message is dropped, as is one from a sender who hasn't
+  heard your announce since the cost was set.
+- **Messages to an old address stay unverified in your apps.** Their
+  signatures cover the old address, which only the sender can change; the
+  notice asks them to.
+- **A sender the network doesn't know is kept unverified.** If no transport
+  node has heard the sender announce, the bouncer can't find their key; it
+  keeps the message and your apps check it once they know the sender.
 
 ## Tests
 
 `cargo test` covers the config, the store (one copy per message, every
 client served, nothing deleted by a client's sync, survival across
-restarts), ratchet decryption (including ratchet files written by Python
-RNS).
+restarts), ratchet decryption and merging (including ratchet files written
+by Python RNS).
 
 `tests/e2e.sh` runs the whole thing against the reference Python RNS and
 LXMF on a private network it starts itself (an `rnsd` with a
@@ -338,9 +351,15 @@ app of the user's runs, reach two Python LXMF clients holding the identity
 twice); a client's reply reaches the sender; an identity not allowed is
 refused; after a restart the stored messages are still there; a message
 left on an ordinary Python propagation node is fetched (decrypted with the
-bouncer's ratchets), served, and purged upstream; the bouncer works as a
-client of a Python `rnsd` shared instance (receiving, serving and fetching
-upstream) and refuses to start without one.
+bouncer's ratchets), served, and purged upstream; a client's send through
+the bouncer reaches both upstream nodes; a sender writing to an old address
+is told the current one, once; the bouncer works as a client of a Python
+`rnsd` shared instance (receiving, serving and fetching upstream) and
+refuses to start without one; with the stamp cost enforced, a message
+without a stamp is dropped while every stamped one gets through; a packet
+encrypted to an app's old ratchet is read; a message held on the second
+upstream node is fetched; a sender the bouncer never heard announce is
+looked up and verified.
 
 ## License
 

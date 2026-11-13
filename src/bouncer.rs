@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::{RnsAccess, Settings};
+use crate::notice::Notices;
 use crate::outbox::{Added, Outbox};
 use crate::store::{ERROR_NO_ACCESS, ERROR_NO_IDENTITY, Ingested, Store, Summary, Via, error_reply, write_atomic};
-use crate::{ratchets, upstream};
+use crate::{notice, ratchets, upstream};
 
 pub const DELIVERY_ASPECT: &str = "lxmf.delivery";
 pub const PROPAGATION_ASPECT: &str = "lxmf.propagation";
@@ -30,7 +31,9 @@ const FIRST_ANNOUNCE_DELAY: Duration = Duration::from_secs(5);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const STATUS_INTERVAL: Duration = Duration::from_secs(60);
 const SUMMARY_LOG_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// Most bytes of outgoing messages waiting for the upstream node.
+/// How long to look for the key of a sender the bouncer hasn't heard of.
+const SENDER_PATH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Most bytes of outgoing messages waiting for each upstream node.
 const OUTBOX_MAX_BYTES: u64 = 50_000_000;
 /// Largest send an app may hand the node, as Python LXMF's per-transfer
 /// limit for clients.
@@ -46,6 +49,12 @@ pub fn now() -> f64 {
 /// The user's LXMF address.
 pub fn delivery_address(identity_hash: &[u8; 16]) -> [u8; 16] {
     Destination::hash_from_name_and_identity(DELIVERY_ASPECT, Some(identity_hash))
+}
+
+/// What the user's address (and an old one) announces: the display name,
+/// and the stamp cost when there is one.
+pub fn delivery_app_data(display_name: Option<&str>, stamp_cost: u8) -> Vec<u8> {
+    get_announce_app_data(display_name, (stamp_cost > 0).then_some(stamp_cost))
 }
 
 /// The propagation node's address.
@@ -142,6 +151,16 @@ pub struct OldIdentity {
     pub address: [u8; 16],
     /// Ratchet rings to decrypt its propagated messages with.
     pub rings: Vec<std::path::PathBuf>,
+    /// Tell its senders the current address.
+    pub notify: bool,
+}
+
+/// Sends waiting for one upstream node.
+pub struct UpstreamQueue {
+    pub node: [u8; 16],
+    pub outbox: Arc<Outbox>,
+    /// Woken when a message is queued.
+    pub ready: tokio::sync::Notify,
 }
 
 /// What the tasks share.
@@ -150,9 +169,8 @@ pub struct Shared {
     pub identity: Identity,
     pub node_identity: Identity,
     pub store: Arc<Store>,
-    pub outbox: Arc<Outbox>,
-    /// Woken when a message is queued for the upstream node.
-    pub outbox_ready: tokio::sync::Notify,
+    /// One queue per upstream node: every send goes to each.
+    pub upstreams: Vec<UpstreamQueue>,
     pub counters: Counters,
     pub last_announce: Mutex<Option<f64>>,
     pub last_upstream: Mutex<Option<UpstreamResult>>,
@@ -160,6 +178,10 @@ pub struct Shared {
     /// then any configured extra ones.
     pub rings: Vec<std::path::PathBuf>,
     pub old: Vec<OldIdentity>,
+    pub notices: Notices,
+    /// Stamp cost asked of senders (0: none), and whether it is enforced.
+    pub stamp_cost: u8,
+    pub enforce_stamps: bool,
 }
 
 /// Check, verify and store one complete LXMF message for the user. Returns
@@ -184,9 +206,14 @@ pub async fn take_in_for(shared: &Arc<Shared>, packed: Vec<u8>, via: Via, old: O
     };
     let source = message.source_hash();
     // Verify the signature when the sender's key is known, as LXMF clients
-    // do: a forged message is dropped; one from an unknown sender is kept,
-    // and the client verifies it once it knows the sender.
-    let verified = match shared.runtime.recall(source).await {
+    // do: a forged message is dropped. An unknown sender's key is asked for
+    // on the network first; if none comes, the message is kept and the
+    // client verifies it once it knows the sender.
+    let mut recalled = shared.runtime.recall(source).await;
+    if matches!(recalled, Ok(None)) && shared.runtime.await_path(source, SENDER_PATH_TIMEOUT).await.is_ok() {
+        recalled = shared.runtime.recall(source).await;
+    }
+    let verified = match recalled {
         Ok(Some(sender)) => match message.verify(&sender.identity.get_public_key()) {
             Ok(_) => "verified",
             Err(e) => {
@@ -196,6 +223,24 @@ pub async fn take_in_for(shared: &Arc<Shared>, packed: Vec<u8>, via: Via, old: O
             }
         },
         _ => "sender unknown, signature not checked",
+    };
+    // The user's own apps (sending to themselves through the node) pay no stamp.
+    let own = source == shared.store.user_address();
+    let stamp = if shared.stamp_cost == 0 || own {
+        ""
+    } else if message.validate_stamp_with_tickets(shared.stamp_cost, None) {
+        ", stamp ok"
+    } else if shared.enforce_stamps {
+        shared.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            "dropped a message from {} ({}): no stamp of cost {}",
+            hex::encode(source),
+            via_label(via),
+            shared.stamp_cost
+        );
+        return false;
+    } else {
+        ", stamp missing or too cheap"
     };
     let (packed, moved) = match old {
         None => (packed, String::new()),
@@ -223,12 +268,13 @@ pub async fn take_in_for(shared: &Arc<Shared>, packed: Vec<u8>, via: Via, old: O
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::info!(
-                "stored message {} from {} ({}{moved}, {verified}; transient id {})",
+                "stored message {} from {} ({}{moved}, {verified}{stamp}; transient id {})",
                 hex::encode(message_id),
                 hex::encode(source),
                 via_label(via),
                 hex::encode(transient_id)
             );
+            notify_sender(shared, old, source);
             true
         }
         Ok(Ok(Ingested::Duplicate { message_id })) => {
@@ -238,6 +284,7 @@ pub async fn take_in_for(shared: &Arc<Shared>, packed: Vec<u8>, via: Via, old: O
                 hex::encode(message_id),
                 via_label(via)
             );
+            notify_sender(shared, old, source);
             true
         }
         Ok(Err(e)) => {
@@ -254,6 +301,15 @@ pub async fn take_in_for(shared: &Arc<Shared>, packed: Vec<u8>, via: Via, old: O
             tracing::error!("storing a message failed: {e}");
             false
         }
+    }
+}
+
+/// A message came to an old address set to notify: tell its sender (once)
+/// where the user is now.
+fn notify_sender(shared: &Arc<Shared>, old: Option<[u8; 16]>, sender: [u8; 16]) {
+    let Some(old) = old else { return };
+    if shared.old.iter().any(|o| o.address == old && o.notify) {
+        tokio::spawn(notice::tell(shared.clone(), old, sender));
     }
 }
 
@@ -368,29 +424,42 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             .map_err(|e| e.to_string())??
     };
     let store = Arc::new(store);
-    let outbox = Arc::new(Outbox::open(&settings.outbox_dir(), OUTBOX_MAX_BYTES, settings.expiry)?);
+    let mut upstreams = Vec::new();
+    for node in &settings.upstream {
+        let outbox = Outbox::open(&settings.outbox_dir_for(node), OUTBOX_MAX_BYTES, settings.expiry)?;
+        upstreams.push(UpstreamQueue {
+            node: *node,
+            outbox: Arc::new(outbox),
+            ready: tokio::sync::Notify::new(),
+        });
+    }
+    move_legacy_outbox(&settings, &upstreams)?;
 
     let shutdown = ShutdownSignal::new();
     let mut signals = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
     let runtime = start_reticulum(&settings, shutdown.clone()).await?;
 
     let ring = ratchets::ring_path(&settings.ratchet_dir(), &address);
+    adopt_ratchets(&identity, &ring, &settings.extra_ratchets)?;
     let mut rings = vec![ring.clone()];
     rings.extend(settings.extra_ratchets.iter().cloned());
     let shared_user_hash = identity.hash;
     let mut old = Vec::new();
-    for (path, extra) in &settings.old_identities {
-        let identity = load_identity(path)?;
+    for o in &settings.old_identities {
+        let identity = load_identity(&o.identity)?;
         if identity.hash == shared_user_hash {
-            return Err(format!("old identity {} is the current identity", path.display()));
+            return Err(format!("old identity {} is the current identity", o.identity.display()));
         }
         let old_address = delivery_address(&identity.hash);
-        let mut rings = vec![ratchets::ring_path(&settings.ratchet_dir(), &old_address)];
-        rings.extend(extra.iter().cloned());
+        let own = ratchets::ring_path(&settings.ratchet_dir(), &old_address);
+        adopt_ratchets(&identity, &own, &o.extra_ratchets)?;
+        let mut rings = vec![own];
+        rings.extend(o.extra_ratchets.iter().cloned());
         old.push(OldIdentity {
             identity,
             address: old_address,
             rings,
+            notify: o.notify_senders,
         });
     }
     let shared = Arc::new(Shared {
@@ -398,13 +467,15 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         identity: identity.clone(),
         node_identity: node_identity.clone(),
         store: store.clone(),
-        outbox,
-        outbox_ready: tokio::sync::Notify::new(),
+        upstreams,
         counters: Counters::default(),
         last_announce: Mutex::new(None),
         last_upstream: Mutex::new(None),
         rings,
         old: old.clone(),
+        notices: Notices::open(settings.notices_path()),
+        stamp_cost: settings.stamp_cost,
+        enforce_stamps: settings.enforce_stamps,
     });
 
     // The user's LXMF address, with ratchets as Python LXMF gives every
@@ -417,7 +488,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             DestinationRuntimeOptions {
                 proof_strategy: ProofStrategy::ProveAll,
                 resource_strategy: ResourceStrategy::AcceptAll,
-                default_app_data: Some(get_announce_app_data(display_name.as_deref(), None)),
+                default_app_data: Some(delivery_app_data(display_name.as_deref(), settings.stamp_cost)),
                 ..DestinationRuntimeOptions::default()
             },
             DestinationRatchetOptions::new(&ring),
@@ -435,7 +506,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                 DestinationRuntimeOptions {
                     proof_strategy: ProofStrategy::ProveAll,
                     resource_strategy: ResourceStrategy::AcceptAll,
-                    default_app_data: Some(get_announce_app_data(display_name.as_deref(), None)),
+                    default_app_data: Some(delivery_app_data(display_name.as_deref(), settings.stamp_cost)),
                     ..DestinationRuntimeOptions::default()
                 },
                 DestinationRatchetOptions::new(&o.rings[0]),
@@ -451,7 +522,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     // it. With no upstream it takes nothing in (no Resources, no proofs for
     // packets), so a propagated send through it fails visibly instead of
     // being kept where its recipient never looks.
-    let takes_sends = settings.upstream.is_some();
+    let takes_sends = !settings.upstream.is_empty();
     let node = runtime
         .register_destination(
             node_identity.clone(),
@@ -531,6 +602,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             node.handle.clone(),
             settings.announce_interval,
             display_name,
+            settings.stamp_cost,
             settings.node_name.clone(),
         )),
         tokio::spawn(delivery_events(shared.clone(), delivery, address, None)),
@@ -545,18 +617,20 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             Some(old_address),
         )));
     }
-    if let Some(upstream) = settings.upstream {
+    if !settings.upstream.is_empty() {
         tracing::info!(
-            "fetching from upstream propagation node {} every {} min",
-            hex::encode(upstream),
+            "fetching from upstream propagation node(s) {} every {} min",
+            settings.upstream.iter().map(hex::encode).collect::<Vec<_>>().join(", "),
             settings.upstream_interval.as_secs() / 60
         );
         tasks.push(tokio::spawn(upstream::run(
             shared.clone(),
-            upstream,
+            settings.upstream.clone(),
             settings.upstream_interval,
         )));
-        tasks.push(tokio::spawn(upstream::forward_loop(shared.clone(), upstream)));
+        for index in 0..shared.upstreams.len() {
+            tasks.push(tokio::spawn(upstream::forward_loop(shared.clone(), index)));
+        }
     }
 
     signals.recv().await;
@@ -569,6 +643,36 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     Ok(())
 }
 
+/// Add the ratchets of apps that announced an address before the bouncer
+/// to the ring the address decrypts with.
+fn adopt_ratchets(identity: &Identity, ring: &Path, extra: &[std::path::PathBuf]) -> Result<(), String> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let added = ratchets::merge_into(identity, ring, extra)?;
+    if added > 0 {
+        tracing::info!("added {added} ratchet(s) of apps to {}", ring.display());
+    }
+    Ok(())
+}
+
+/// Sends queued before there was a queue per upstream node: give each
+/// node's queue a copy.
+fn move_legacy_outbox(settings: &Settings, upstreams: &[UpstreamQueue]) -> Result<(), String> {
+    if upstreams.is_empty() {
+        return Ok(());
+    }
+    let legacy = Outbox::open(&settings.outbox_dir(), u64::MAX, settings.expiry)?;
+    for queued in legacy.pending() {
+        for upstream in upstreams {
+            upstream.outbox.add(&queued.data)?;
+        }
+        legacy.remove(&queued.transient_id);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn announcer(
     shared: Arc<Shared>,
     delivery: DestinationHandle,
@@ -576,13 +680,14 @@ async fn announcer(
     node: DestinationHandle,
     every: Duration,
     display_name: Option<String>,
+    stamp_cost: u8,
     node_name: Option<String>,
 ) {
     tokio::time::sleep(FIRST_ANNOUNCE_DELAY).await;
     loop {
         let delivered = delivery
             .announce(DestinationAnnounceOptions {
-                app_data: Some(get_announce_app_data(display_name.as_deref(), None)),
+                app_data: Some(delivery_app_data(display_name.as_deref(), stamp_cost)),
                 ..DestinationAnnounceOptions::default()
             })
             .await;
@@ -595,7 +700,7 @@ async fn announcer(
         for handle in &old {
             if let Err(e) = handle
                 .announce(DestinationAnnounceOptions {
-                    app_data: Some(get_announce_app_data(display_name.as_deref(), None)),
+                    app_data: Some(delivery_app_data(display_name.as_deref(), stamp_cost)),
                     ..DestinationAnnounceOptions::default()
                 })
                 .await
@@ -714,7 +819,7 @@ async fn take_submission(shared: Arc<Shared>, data: Vec<u8>) {
         }
     };
     let address = shared.store.user_address();
-    let mut queued = false;
+    let mut queued = vec![false; shared.upstreams.len()];
     for entry in entries {
         let Some(data) = entry else {
             shared.counters.outgoing_refused.fetch_add(1, Ordering::Relaxed);
@@ -737,29 +842,48 @@ async fn take_submission(shared: Arc<Shared>, data: Vec<u8>) {
             }
             continue;
         }
-        let outbox = shared.outbox.clone();
         let destination = hex::encode(&data[..16]);
-        match tokio::task::spawn_blocking(move || outbox.add(&data)).await {
-            Ok(Ok((Added::Queued, id))) => {
-                shared.counters.outgoing_queued.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    "queued outgoing message {} to {destination} for upstream",
-                    hex::encode(id)
-                );
-                queued = true;
+        let outboxes: Vec<Arc<Outbox>> = shared.upstreams.iter().map(|u| u.outbox.clone()).collect();
+        let added = tokio::task::spawn_blocking(move || {
+            outboxes.iter().map(|outbox| outbox.add(&data)).collect::<Vec<_>>()
+        })
+        .await;
+        let added = match added {
+            Ok(added) => added,
+            Err(e) => {
+                tracing::error!("queueing an outgoing message failed: {e}");
+                continue;
             }
-            Ok(Ok((Added::Duplicate, id))) => {
-                tracing::debug!("outgoing message {} is queued already", hex::encode(id));
+        };
+        let mut new = None;
+        let mut errors = Vec::new();
+        for (index, result) in added.into_iter().enumerate() {
+            match result {
+                Ok((Added::Queued, id)) => {
+                    new = Some(id);
+                    queued[index] = true;
+                }
+                Ok((Added::Duplicate, id)) => {
+                    tracing::debug!("outgoing message {} is queued already", hex::encode(id));
+                }
+                Err(e) => errors.push(e),
             }
-            Ok(Err(e)) => {
+        }
+        if let Some(id) = new {
+            shared.counters.outgoing_queued.fetch_add(1, Ordering::Relaxed);
+            tracing::info!("queued outgoing message {} to {destination} for upstream", hex::encode(id));
+        }
+        if !errors.is_empty() {
+            if new.is_none() {
                 shared.counters.outgoing_refused.fetch_add(1, Ordering::Relaxed);
-                tracing::error!("could not queue an outgoing message to {destination}: {e}");
             }
-            Err(e) => tracing::error!("queueing an outgoing message failed: {e}"),
+            tracing::error!("could not queue an outgoing message to {destination}: {}", errors.join("; "));
         }
     }
-    if queued {
-        shared.outbox_ready.notify_one();
+    for (upstream, queued) in shared.upstreams.iter().zip(queued) {
+        if queued {
+            upstream.ready.notify_one();
+        }
     }
 }
 
@@ -777,8 +901,8 @@ async fn write_status(shared: &Arc<Shared>, settings: &Settings) {
     let summary = tokio::task::spawn_blocking(move || store.summary())
         .await
         .unwrap_or_default();
-    let outbox = shared.outbox.clone();
-    let outbox_count = tokio::task::spawn_blocking(move || outbox.summary().0)
+    let outboxes: Vec<Arc<Outbox>> = shared.upstreams.iter().map(|u| u.outbox.clone()).collect();
+    let outbox_count = tokio::task::spawn_blocking(move || outboxes.iter().map(|o| o.summary().0).max().unwrap_or(0))
         .await
         .unwrap_or_default();
     let c = &shared.counters;
@@ -806,7 +930,9 @@ async fn write_status(shared: &Arc<Shared>, settings: &Settings) {
         outgoing_refused: c.outgoing_refused.load(Ordering::Relaxed),
         sent_upstream: c.sent_upstream.load(Ordering::Relaxed),
         outbox: outbox_count,
-        upstream: settings.upstream.map(hex::encode),
+        upstream: (!settings.upstream.is_empty()).then(|| {
+            settings.upstream.iter().map(hex::encode).collect::<Vec<_>>().join(", ")
+        }),
         last_upstream: shared.last_upstream.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         store: summary,
     };

@@ -8,6 +8,7 @@
 
 mod bouncer;
 mod config;
+mod notice;
 mod outbox;
 mod ratchets;
 mod store;
@@ -156,8 +157,8 @@ fn main() -> ExitCode {
                 hex::encode(bouncer::delivery_address(&identity.hash))
             );
             println!("propagation node   {}", hex::encode(bouncer::node_address(&node.hash)));
-            for (path, _) in &settings.old_identities {
-                let old = bouncer::load_identity(path)?;
+            for o in &settings.old_identities {
+                let old = bouncer::load_identity(&o.identity)?;
                 println!(
                     "old address        {}",
                     hex::encode(bouncer::delivery_address(&old.hash))

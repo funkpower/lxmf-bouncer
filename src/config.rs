@@ -31,6 +31,8 @@ pub struct Config {
     pub node: NodeSection,
     #[serde(default)]
     pub upstream: UpstreamSection,
+    #[serde(default)]
+    pub stamps: StampsSection,
     /// Identities the user had before, whose messages the bouncer also
     /// takes and hands to the apps (`[[old_identity]]`).
     #[serde(default)]
@@ -48,6 +50,30 @@ pub struct OldIdentitySection {
     /// `[upstream] extra_ratchets`).
     #[serde(default)]
     pub extra_ratchets: Vec<PathBuf>,
+    /// Tell each sender who writes to this address, once, the user's current
+    /// address (a message signed by this old identity).
+    #[serde(default)]
+    pub notify_senders: bool,
+}
+
+/// Proof of work asked of people sending to the user.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StampsSection {
+    /// The stamp cost announced with the user's address (and old ones).
+    #[serde(default)]
+    pub cost: Option<u8>,
+    /// Drop messages to the user whose stamp doesn't meet `cost`.
+    #[serde(default)]
+    pub enforce: bool,
+}
+
+/// One hash or a list of them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
 }
 
 /// How to reach Reticulum. Exactly one of `shared_instance`, `tcp` or
@@ -125,10 +151,10 @@ pub struct NodeSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamSection {
-    /// A propagation node (its `lxmf.propagation` hash) to fetch the user's
-    /// messages from.
+    /// Propagation nodes (their `lxmf.propagation` hashes) to fetch the
+    /// user's messages from and to pass the apps' sends to: one, or a list.
     #[serde(default)]
-    pub node: Option<String>,
+    pub node: Option<OneOrMany>,
     /// Minutes between fetches.
     #[serde(default = "default_upstream_minutes")]
     pub interval_minutes: u64,
@@ -187,11 +213,21 @@ pub struct Settings {
     pub node_identity: PathBuf,
     pub node_name: Option<String>,
     pub allowed_identities: Vec<[u8; 16]>,
-    pub upstream: Option<[u8; 16]>,
+    pub upstream: Vec<[u8; 16]>,
     pub upstream_interval: Duration,
     pub extra_ratchets: Vec<PathBuf>,
-    /// Old identities: key file and extra ratchet files.
-    pub old_identities: Vec<(PathBuf, Vec<PathBuf>)>,
+    /// Stamp cost announced for the user's address (0: none).
+    pub stamp_cost: u8,
+    pub enforce_stamps: bool,
+    pub old_identities: Vec<OldIdentitySettings>,
+}
+
+/// An old identity, checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OldIdentitySettings {
+    pub identity: PathBuf,
+    pub extra_ratchets: Vec<PathBuf>,
+    pub notify_senders: bool,
 }
 
 /// Parse a 16-byte hash written as 32 hex characters (`<` `>` and `:`
@@ -284,11 +320,25 @@ impl Config {
             .iter()
             .map(|h| parse_hash(h).ok_or_else(|| format!("[node]: allowed_identities: {h:?} is not 32 hex characters")))
             .collect::<Result<Vec<_>, _>>()?;
-        let upstream = match &self.upstream.node {
-            None => None,
-            Some(h) if h.trim().is_empty() => None,
-            Some(h) => Some(parse_hash(h).ok_or_else(|| format!("[upstream]: node {h:?} is not 32 hex characters"))?),
+        let listed: Vec<&String> = match &self.upstream.node {
+            None => Vec::new(),
+            Some(OneOrMany::One(h)) => vec![h],
+            Some(OneOrMany::Many(hs)) => hs.iter().collect(),
         };
+        let mut upstream = Vec::new();
+        for h in listed.into_iter().filter(|h| !h.trim().is_empty()) {
+            let hash = parse_hash(h).ok_or_else(|| format!("[upstream]: node {h:?} is not 32 hex characters"))?;
+            if !upstream.contains(&hash) {
+                upstream.push(hash);
+            }
+        }
+        let stamp_cost = self.stamps.cost.unwrap_or(0);
+        if stamp_cost > 254 {
+            return Err("[stamps]: cost must be at most 254".into());
+        }
+        if self.stamps.enforce && stamp_cost == 0 {
+            return Err("[stamps]: enforce = true needs a cost of at least 1".into());
+        }
         if self.upstream.interval_minutes == 0 {
             return Err("[upstream]: interval_minutes must be at least 1".into());
         }
@@ -310,14 +360,15 @@ impl Config {
             upstream,
             upstream_interval: Duration::from_secs(self.upstream.interval_minutes * 60),
             extra_ratchets: self.upstream.extra_ratchets.iter().map(|p| resolve(p)).collect(),
+            stamp_cost,
+            enforce_stamps: self.stamps.enforce,
             old_identities: self
                 .old_identity
                 .iter()
-                .map(|o| {
-                    (
-                        resolve(&o.identity),
-                        o.extra_ratchets.iter().map(|p| resolve(p)).collect(),
-                    )
+                .map(|o| OldIdentitySettings {
+                    identity: resolve(&o.identity),
+                    extra_ratchets: o.extra_ratchets.iter().map(|p| resolve(p)).collect(),
+                    notify_senders: o.notify_senders,
                 })
                 .collect(),
         })
@@ -341,6 +392,14 @@ impl Settings {
     }
     pub fn outbox_dir(&self) -> PathBuf {
         self.state_dir.join("outbox")
+    }
+    /// Sends waiting for one upstream node.
+    pub fn outbox_dir_for(&self, node: &[u8; 16]) -> PathBuf {
+        self.outbox_dir().join(hex::encode(node))
+    }
+    /// Senders told about the user's current address.
+    pub fn notices_path(&self) -> PathBuf {
+        self.state_dir.join("moved_notices.json")
     }
     pub fn ratchet_dir(&self) -> PathBuf {
         self.state_dir.join("ratchets")
@@ -401,7 +460,8 @@ mod tests {
         assert_eq!(s.expiry, Duration::from_secs(30 * 86_400));
         assert_eq!(s.max_store_bytes, 500_000_000);
         assert_eq!(s.node_identity, PathBuf::from("/var/lib/b/node_identity"));
-        assert!(s.upstream.is_none());
+        assert!(s.upstream.is_empty());
+        assert_eq!(s.stamp_cost, 0);
         let generated = s.generated_rns_config().unwrap();
         assert!(generated.contains("share_instance = No"));
         assert!(generated.contains("target_port = 4242"));
@@ -432,9 +492,32 @@ mod tests {
             "{MINIMAL}[upstream]\nnode = \"<a67a6768c612e972746eaaeb6ee242e1>\"\n[node]\nallowed_identities = [\"00112233445566778899aabbccddeeff\"]\n"
         );
         let s = Config::parse(&good).unwrap().settings(Path::new("/")).unwrap();
-        assert_eq!(s.upstream.unwrap()[0], 0xa6);
+        assert_eq!(s.upstream, vec![parse_hash("a67a6768c612e972746eaaeb6ee242e1").unwrap()]);
         assert_eq!(s.allowed_identities.len(), 1);
+        let two = format!(
+            "{MINIMAL}[upstream]\nnode = [\"a67a6768c612e972746eaaeb6ee242e1\", \"00112233445566778899aabbccddeeff\", \"a67a6768c612e972746eaaeb6ee242e1\"]\n"
+        );
+        assert_eq!(Config::parse(&two).unwrap().settings(Path::new("/")).unwrap().upstream.len(), 2);
         let typo = format!("{MINIMAL}[store]\nexpiry = 3\n");
         assert!(Config::parse(&typo).is_err());
+    }
+
+    #[test]
+    fn stamps_and_old_identities() {
+        let enforce_free = format!("{MINIMAL}[stamps]\nenforce = true\n");
+        assert!(Config::parse(&enforce_free).unwrap().settings(Path::new("/")).is_err());
+        let set = format!(
+            "{MINIMAL}[stamps]\ncost = 8\nenforce = true\n[[old_identity]]\nidentity = \"old\"\nnotify_senders = true\n"
+        );
+        let s = Config::parse(&set).unwrap().settings(Path::new("/etc/b")).unwrap();
+        assert_eq!((s.stamp_cost, s.enforce_stamps), (8, true));
+        assert_eq!(
+            s.old_identities,
+            vec![OldIdentitySettings {
+                identity: PathBuf::from("/etc/b/old"),
+                extra_ratchets: Vec::new(),
+                notify_senders: true
+            }]
+        );
     }
 }

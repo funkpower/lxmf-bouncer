@@ -51,14 +51,17 @@ allowed_identities = []
 
 [upstream]
 # A propagation node that may hold messages for you (people whose direct
-# delivery failed send there). Optional. The bouncer also passes it what
-# your apps send through the bouncer's node, for people who are offline.
+# delivery failed send there), or a list of them. Optional. The bouncer
+# fetches from each, and passes each what your apps send through the
+# bouncer's node, for people who are offline. More nodes reach more of the
+# people who collect from nodes that don't peer with each other.
 # node = "a67a6768c612e972746eaaeb6ee242e1"
+# node = ["a67a6768c612e972746eaaeb6ee242e1", "<another node>"]
 interval_minutes = 15
 # Ratchet files of clients that announced your address before the bouncer
 # did. Senders may still encrypt to those ratchets for a while (they keep
 # the newest ratchet they heard); with these the bouncer can read such
-# messages from the upstream node.
+# messages, whether they come straight to it or from an upstream node.
 # extra_ratchets = ["~/.nomadnetwork/storage/lxmf/ratchets/<your LXMF address>.ratchets"]
 
 # An identity you used before, whose address people may still write to.
@@ -67,3 +70,16 @@ interval_minutes = 15
 # [[old_identity]]
 # identity = "~/.local/share/lxmf-bouncer/old.identity"
 # extra_ratchets = ["~/.nomadnetwork/storage/lxmf/ratchets/<old LXMF address>.ratchets"]
+# Send each person who writes to the old address, once, a message from it
+# giving your current address. Their messages show as unverified in your
+# apps until they switch.
+# notify_senders = true
+
+[stamps]
+# Proof of work asked of people writing to you, announced with your address
+# (and old ones). 0 or unset: none. 8 costs a sender well under a second.
+# cost = 8
+# Drop messages without a good enough stamp. A sender who hasn't heard
+# your announce since the cost was set, or whose stamp is a ticket one of
+# your apps gave them, sends none, and their message is dropped.
+# enforce = false
